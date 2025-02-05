@@ -15,11 +15,10 @@ use crate::decoder::DynHandle;
 use crate::decoder::FramePool;
 use crate::decoder::MappableHandle;
 use crate::decoder::StreamInfo;
-use crate::DecodedFormat;
-use crate::Resolution;
-
 use crate::device::v4l2::stateless::device::V4l2Device;
 use crate::device::v4l2::stateless::request::V4l2Request;
+use crate::DecodedFormat;
+use crate::Resolution;
 
 pub struct V4l2Picture {
     request: V4l2Request,
@@ -79,12 +78,14 @@ impl<'a> DynHandle for std::cell::Ref<'a, BackendHandle> {
 
 pub struct V4l2StatelessDecoderHandle {
     pub handle: Rc<RefCell<BackendHandle>>,
+    pub stream_info: StreamInfo,
 }
 
 impl Clone for V4l2StatelessDecoderHandle {
     fn clone(&self) -> Self {
         Self {
             handle: Rc::clone(&self.handle),
+            stream_info: self.stream_info.clone(),
         }
     }
 }
@@ -93,11 +94,11 @@ impl DecodedHandle for V4l2StatelessDecoderHandle {
     type Descriptor = ();
 
     fn coded_resolution(&self) -> Resolution {
-        todo!();
+        self.stream_info.coded_resolution.clone()
     }
 
     fn display_resolution(&self) -> Resolution {
-        todo!();
+        self.stream_info.display_resolution.clone()
     }
 
     fn timestamp(&self) -> u64 {
@@ -123,7 +124,7 @@ impl DecodedHandle for V4l2StatelessDecoderHandle {
 
 pub struct V4l2StatelessDecoderBackend {
     pub device: V4l2Device,
-    stream_info: StreamInfo,
+    pub stream_info: StreamInfo,
 }
 
 impl V4l2StatelessDecoderBackend {
@@ -144,7 +145,7 @@ impl FramePool for V4l2StatelessDecoderBackend {
     type Descriptor = ();
 
     fn coded_resolution(&self) -> Resolution {
-        todo!();
+        self.stream_info.coded_resolution
     }
 
     fn set_coded_resolution(&mut self, _resolution: Resolution) {
@@ -183,12 +184,8 @@ where
         // The values provided here are directly from the codec (modulo format).
         // Hardware may handle this differently, i.e. buffer padding.
         self.stream_info.format = format;
-        let visible_rect = format_info.visible_rect();
 
-        let display_resolution = Resolution {
-            width: visible_rect.1 .0 - visible_rect.0 .0,
-            height: visible_rect.1 .1 - visible_rect.0 .1,
-        };
+        let display_resolution = Resolution::from(format_info.visible_rect());
 
         self.stream_info.min_num_frames = format_info.min_num_frames();
         self.stream_info.coded_resolution = format_info.coded_size();

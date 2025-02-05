@@ -3,6 +3,8 @@
 // found in the LICENSE file.
 
 use std::ffi::OsStr;
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -10,32 +12,10 @@ use std::str::FromStr;
 use argh::FromArgs;
 
 use cros_codecs::DecodedFormat;
+use cros_codecs::EncodedFormat;
+use cros_codecs::FrameMemoryType;
 
-#[derive(Debug, PartialEq, Eq, Copy, Clone)]
-pub enum EncodedFormat {
-    H264,
-    H265,
-    VP8,
-    VP9,
-    AV1,
-}
-
-impl FromStr for EncodedFormat {
-    type Err = &'static str;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "h264" | "H264" => Ok(EncodedFormat::H264),
-            "h265" | "H265" => Ok(EncodedFormat::H265),
-            "vp8" | "VP8" => Ok(EncodedFormat::VP8),
-            "vp9" | "VP9" => Ok(EncodedFormat::VP9),
-            "av1" | "AV1" => Ok(EncodedFormat::AV1),
-            _ => Err("unrecognized input format. Valid values: h264, h265, vp8, vp9, av1"),
-        }
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum Md5Computation {
     Stream,
     Frame,
@@ -49,26 +29,6 @@ impl FromStr for Md5Computation {
             "stream" => Ok(Md5Computation::Stream),
             "frame" => Ok(Md5Computation::Frame),
             _ => Err("unrecognized MD5 computation option. Valid values: stream, frame"),
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq, Copy, Clone)]
-pub enum FrameMemoryType {
-    Managed,
-    Prime,
-    User,
-}
-
-impl FromStr for FrameMemoryType {
-    type Err = &'static str;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "managed" => Ok(FrameMemoryType::Managed),
-            "prime" => Ok(FrameMemoryType::Prime),
-            "user" => Ok(FrameMemoryType::User),
-            _ => Err("unrecognized memory type. Valid values: managed, prime, user"),
         }
     }
 }
@@ -138,4 +98,31 @@ pub fn decide_output_file_name<'a>(output: &'a Path, index: i32) -> PathBuf {
         let new_file_name = format!("{}_{}", stem, index);
         PathBuf::from(String::from(output.to_str().unwrap()).replace(file_name, &new_file_name))
     }
+}
+
+// Vector of per frame md5 sums
+pub fn golden_md5s(path: &Option<PathBuf>) -> Vec<String> {
+    let golden_md5s: Vec<String> = match path {
+        None => vec![],
+        Some(ref path) => {
+            let mut golden_file_content = String::new();
+            File::open(&path)
+                .expect("error opening golden file")
+                .read_to_string(&mut golden_file_content)
+                .expect("error reading golden file");
+            let parsed_json: serde_json::Value =
+                serde_json::from_str(&golden_file_content).expect("error parsing golden file");
+            match &parsed_json["md5_checksums"] {
+                serde_json::Value::Array(checksums) => checksums
+                    .iter()
+                    .map(|x| match x {
+                        serde_json::Value::String(checksum) => String::from(checksum),
+                        _ => panic!("error parsing golden file"),
+                    })
+                    .collect(),
+                _ => panic!("error parsing golden file"),
+            }
+        }
+    };
+    golden_md5s
 }

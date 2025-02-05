@@ -23,17 +23,19 @@
 pub mod bitstream_utils;
 pub mod codec;
 
-#[cfg(any(feature = "vaapi", feature = "v4l2"))]
+#[cfg(feature = "backend")]
 pub mod backend;
-#[cfg(any(feature = "vaapi", feature = "v4l2"))]
+#[cfg(feature = "backend")]
+pub mod c2_wrapper;
+#[cfg(feature = "backend")]
 pub mod decoder;
 #[cfg(feature = "v4l2")]
 pub mod device;
-#[cfg(any(feature = "vaapi", feature = "v4l2"))]
+#[cfg(feature = "backend")]
 pub mod encoder;
-#[cfg(any(feature = "vaapi", feature = "v4l2"))]
+#[cfg(feature = "backend")]
 pub mod image_processing;
-#[cfg(any(feature = "vaapi", feature = "v4l2"))]
+#[cfg(feature = "backend")]
 pub mod utils;
 
 use std::str::FromStr;
@@ -42,6 +44,26 @@ use std::str::FromStr;
 pub use libva;
 #[cfg(feature = "v4l2")]
 pub use v4l2r;
+
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub enum FrameMemoryType {
+    Managed,
+    Prime,
+    User,
+}
+
+impl FromStr for FrameMemoryType {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "managed" => Ok(FrameMemoryType::Managed),
+            "prime" => Ok(FrameMemoryType::Prime),
+            "user" => Ok(FrameMemoryType::User),
+            _ => Err("unrecognized memory type. Valid values: managed, prime, user"),
+        }
+    }
+}
 
 /// Rounding modes for `Resolution`
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -100,6 +122,44 @@ impl From<Resolution> for (u32, u32) {
     }
 }
 
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Rect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl From<Rect> for Resolution {
+    fn from(value: Rect) -> Self {
+        Self {
+            width: value.width - value.x,
+            height: value.height - value.y,
+        }
+    }
+}
+
+impl From<Resolution> for Rect {
+    fn from(value: Resolution) -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            width: value.width,
+            height: value.height,
+        }
+    }
+}
+
+impl From<((u32, u32), (u32, u32))> for Rect {
+    fn from(value: ((u32, u32), (u32, u32))) -> Self {
+        Self {
+            x: value.0 .0,
+            y: value.0 .1,
+            width: value.1 .0,
+            height: value.1 .1,
+        }
+    }
+}
 /// Wrapper around u32 when they are meant to be a fourcc.
 ///
 /// Provides conversion and display/debug implementations useful when dealing with fourcc codes.
@@ -177,6 +237,9 @@ pub enum DecodedFormat {
     I410,
     /// Y, U and V planes, 4:4:4 sampling, 16 bits per sample, LE. Only the 12 LSBs are used.
     I412,
+    /// One Y and one interleaved UV plane, 4:2:0 sampling, 8 bits per sample.
+    /// In a tiled format.
+    MM21,
 }
 
 impl FromStr for DecodedFormat {
@@ -194,9 +257,78 @@ impl FromStr for DecodedFormat {
             "i212" | "I212" => Ok(DecodedFormat::I212),
             "i410" | "I410" => Ok(DecodedFormat::I410),
             "i412" | "I412" => Ok(DecodedFormat::I412),
-            _ => {
-                Err("unrecognized output format. Valid values: i420, nv12, i422, i444, i010, i012, i210, i212, i410, i412")
-            }
+            "mm21" | "MM21" => Ok(DecodedFormat::MM21),
+            _ => Err("unrecognized output format. \
+                Valid values: i420, nv12, i422, i444, i010, i012, i210, i212, i410, i412, mm21"),
+        }
+    }
+}
+
+impl From<Fourcc> for DecodedFormat {
+    fn from(fourcc: Fourcc) -> DecodedFormat {
+        match fourcc.to_string().as_str() {
+            "I420" => DecodedFormat::I420,
+            "NV12" => DecodedFormat::NV12,
+            _ => todo!("Fourcc {} not yet supported", fourcc),
+        }
+    }
+}
+
+impl From<DecodedFormat> for Fourcc {
+    fn from(format: DecodedFormat) -> Fourcc {
+        match format {
+            DecodedFormat::I420 => Fourcc::from(b"I420"),
+            DecodedFormat::NV12 => Fourcc::from(b"NV12"),
+            _ => todo!(),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub enum EncodedFormat {
+    H264,
+    H265,
+    VP8,
+    VP9,
+    AV1,
+}
+
+impl FromStr for EncodedFormat {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "h264" | "H264" => Ok(EncodedFormat::H264),
+            "h265" | "H265" => Ok(EncodedFormat::H265),
+            "vp8" | "VP8" => Ok(EncodedFormat::VP8),
+            "vp9" | "VP9" => Ok(EncodedFormat::VP9),
+            "av1" | "AV1" => Ok(EncodedFormat::AV1),
+            _ => Err("unrecognized input format. Valid values: h264, h265, vp8, vp9, av1"),
+        }
+    }
+}
+
+impl From<Fourcc> for EncodedFormat {
+    fn from(fourcc: Fourcc) -> EncodedFormat {
+        match fourcc.to_string().as_str() {
+            "H264" => EncodedFormat::H264,
+            "HEVC" => EncodedFormat::H265,
+            "VP80" => EncodedFormat::VP8,
+            "VP90" => EncodedFormat::VP9,
+            "AV1F" => EncodedFormat::AV1,
+            _ => todo!("Fourcc {} not yet supported", fourcc),
+        }
+    }
+}
+
+impl From<EncodedFormat> for Fourcc {
+    fn from(format: EncodedFormat) -> Fourcc {
+        match format {
+            EncodedFormat::H264 => Fourcc::from(b"H264"),
+            EncodedFormat::H265 => Fourcc::from(b"HEVC"),
+            EncodedFormat::VP8 => Fourcc::from(b"VP80"),
+            EncodedFormat::VP9 => Fourcc::from(b"VP90"),
+            EncodedFormat::AV1 => Fourcc::from(b"AV1F"),
         }
     }
 }
@@ -252,7 +384,7 @@ pub struct FrameLayout {
 #[macro_export]
 macro_rules! multiple_desc_type {
     (enum $s:ident { $($v:ident($t:ty),)* } ) => {
-        enum $s {
+        pub enum $s {
             $($v($t),)*
         }
 
@@ -298,6 +430,7 @@ pub fn decoded_frame_size(format: DecodedFormat, width: usize, height: usize) ->
             u_size + uv_size
         }
         DecodedFormat::I410 | DecodedFormat::I412 => (width * height * 2) * 3,
+        DecodedFormat::MM21 => panic!("Unable to convert to MM21"),
     }
 }
 
