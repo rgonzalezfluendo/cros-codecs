@@ -2,6 +2,12 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use nix::errno::Errno;
+use nix::sys::eventfd::EfdFlags;
+use nix::sys::eventfd::EventFd;
+
+use thiserror::Error;
+
 use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::sync::atomic::AtomicU32;
@@ -153,20 +159,22 @@ pub enum C2Status {
 }
 
 // J should be either C2DecodeJob or C2EncodeJob.
-pub trait C2Worker<J, U, E, W>
+pub trait C2Worker<J, E, W>
 where
-    U: Clone + Send + 'static,
     E: FnMut(C2Status) + Send + 'static,
     W: FnMut(J) + Send + 'static,
     J: Send + Job + 'static,
 {
+    type Options: Clone + Send + 'static;
+
     fn new(
         fourcc: Fourcc,
+        awaiting_job_event: Arc<EventFd>,
         error_cb: Arc<Mutex<E>>,
         work_done_cb: Arc<Mutex<W>>,
         work_queue: Arc<Mutex<VecDeque<J>>>,
         state: Arc<Mutex<C2State>>,
-        options: U,
+        options: Self::Options,
     ) -> Result<Self, String>
     where
         Self: Sized;
@@ -174,37 +182,52 @@ where
     fn process_loop(&mut self);
 }
 
+#[derive(Debug, Error)]
+pub enum C2WrapperError {
+    #[error("failed to create EventFd for awaiting job event: {0}")]
+    AwaitingJobEventFd(Errno),
+}
+
 // Note that we do not guarantee thread safety in C2CrosCodecsWrapper.
-pub struct C2Wrapper<J, U, E, W, V>
+pub struct C2Wrapper<J, E, W, V>
 where
-    U: Clone + Send + 'static,
     E: FnMut(C2Status) + Send + 'static,
     W: FnMut(J) + Send + 'static,
     J: Send + Default + Job + 'static,
-    V: C2Worker<J, U, E, W>,
+    V: C2Worker<J, E, W>,
 {
+    awaiting_job_event: Arc<EventFd>,
     fourcc: Fourcc,
     error_cb: Arc<Mutex<E>>,
     work_done_cb: Arc<Mutex<W>>,
     work_queue: Arc<Mutex<VecDeque<J>>>,
     state: Arc<Mutex<C2State>>,
-    options: U,
+    options: <V as C2Worker<J, E, W>>::Options,
     worker_thread: Option<JoinHandle<()>>,
     // The instance of V actually lives in the thread creation closure, not
     // this struct.
     _phantom: PhantomData<V>,
 }
 
-impl<J, U, E, W, V> C2Wrapper<J, U, E, W, V>
+impl<J, E, W, V> C2Wrapper<J, E, W, V>
 where
-    U: Clone + Send + 'static,
     E: FnMut(C2Status) + Send + 'static,
     W: FnMut(J) + Send + 'static,
     J: Send + Default + Job + 'static,
-    V: C2Worker<J, U, E, W>,
+    V: C2Worker<J, E, W>,
 {
-    pub fn new(fourcc: Fourcc, error_cb: E, work_done_cb: W, options: U) -> Self {
+    pub fn new(
+        fourcc: Fourcc,
+        error_cb: E,
+        work_done_cb: W,
+        options: <V as C2Worker<J, E, W>>::Options,
+    ) -> Self {
         Self {
+            awaiting_job_event: Arc::new(
+                EventFd::from_flags(EfdFlags::EFD_SEMAPHORE)
+                    .map_err(C2WrapperError::AwaitingJobEventFd)
+                    .unwrap(),
+            ),
             fourcc: fourcc,
             error_cb: Arc::new(Mutex::new(error_cb)),
             work_done_cb: Arc::new(Mutex::new(work_done_cb)),
@@ -243,9 +266,11 @@ where
         let work_queue = self.work_queue.clone();
         let state = self.state.clone();
         let options = self.options.clone();
+        let awaiting_job_event = self.awaiting_job_event.clone();
         self.worker_thread = Some(thread::spawn(move || {
             let worker = V::new(
                 fourcc,
+                awaiting_job_event,
                 error_cb.clone(),
                 work_done_cb,
                 work_queue,
@@ -284,6 +309,8 @@ where
 
         self.work_queue.lock().unwrap().drain(..);
 
+        self.awaiting_job_event.write(1).unwrap();
+
         C2Status::C2Ok
     }
 
@@ -300,6 +327,8 @@ where
             .lock()
             .unwrap()
             .extend(work_items.into_iter());
+
+        self.awaiting_job_event.write(1).unwrap();
 
         C2Status::C2Ok
     }
@@ -341,19 +370,20 @@ where
         drain_job.set_drain();
         self.work_queue.lock().unwrap().push_back(drain_job);
 
+        self.awaiting_job_event.write(1).unwrap();
+
         C2Status::C2Ok
     }
 }
 
 // Instead of C2's release() function, we implement Drop and use RAII to
 // accomplish the same thing
-impl<J, U, E, W, V> Drop for C2Wrapper<J, U, E, W, V>
+impl<J, E, W, V> Drop for C2Wrapper<J, E, W, V>
 where
-    U: Clone + Send + 'static,
     E: FnMut(C2Status) + Send + 'static,
     W: FnMut(J) + Send + 'static,
     J: Send + Default + Job + 'static,
-    V: C2Worker<J, U, E, W>,
+    V: C2Worker<J, E, W>,
 {
     fn drop(&mut self) {
         self.stop();

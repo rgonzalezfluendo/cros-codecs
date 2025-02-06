@@ -7,11 +7,8 @@
 
 use std::borrow::Cow;
 use std::fs::File;
-use std::io::Cursor;
 use std::io::Read;
 use std::io::Write;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
@@ -207,13 +204,7 @@ fn main() {
     };
 
     #[cfg(feature = "vaapi")]
-    let mut decoder: C2Wrapper<
-        _,
-        _,
-        _,
-        _,
-        C2DecoderWorker<_, C2VaapiDecoder, _, _, _, _, _, _>,
-    > = C2Wrapper::new(
+    let mut decoder: C2Wrapper<_, _, _, C2DecoderWorker<C2VaapiDecoder, _, _, _>> = C2Wrapper::new(
         Fourcc::from(args.input_format),
         error_cb,
         on_new_frame,
@@ -224,13 +215,7 @@ fn main() {
         },
     );
     #[cfg(feature = "v4l2")]
-    let mut decoder: C2Wrapper<
-        _,
-        _,
-        _,
-        _,
-        C2DecoderWorker<_, C2V4L2Decoder, _, _, _, _, _, _>,
-    > = C2Wrapper::new(
+    let mut decoder: C2Wrapper<_, _, _, C2DecoderWorker<C2V4L2Decoder, _, _, _>> = C2Wrapper::new(
         Fourcc::from(args.input_format),
         error_cb,
         on_new_frame,

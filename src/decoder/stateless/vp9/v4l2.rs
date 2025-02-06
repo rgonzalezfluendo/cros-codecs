@@ -24,7 +24,6 @@ use crate::decoder::stateless::StatelessBackendResult;
 use crate::decoder::stateless::StatelessDecoder;
 use crate::decoder::stateless::StatelessDecoderBackendPicture;
 use crate::decoder::BlockingMode;
-use crate::decoder::DecodedHandle;
 use crate::device::v4l2::stateless::controls::vp9::Vp9V4l2Control;
 use crate::Fourcc;
 use crate::Rect;
@@ -73,7 +72,7 @@ impl StatelessVp9DecoderBackend for V4l2StatelessDecoderBackend {
         hdr: &Header,
         reference_frames: &[Option<Self::Handle>; NUM_REF_FRAMES],
         bitstream: &[u8],
-        segmentation: &[Segmentation; MAX_SEGMENTS],
+        _segmentation: &[Segmentation; MAX_SEGMENTS],
     ) -> StatelessBackendResult<Self::Handle> {
         let mut ctrl = Vp9V4l2Control::from(hdr);
 

@@ -2,13 +2,21 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use nix::errno::Errno;
+use nix::sys::epoll::Epoll;
+use nix::sys::epoll::EpollCreateFlags;
+use nix::sys::epoll::EpollEvent;
+use nix::sys::epoll::EpollFlags;
+use nix::sys::epoll::EpollTimeout;
+use nix::sys::eventfd::EventFd;
+
+use std::os::fd::AsFd;
+use thiserror::Error;
+
 use std::clone::Clone;
 use std::collections::VecDeque;
-use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::thread;
-use std::time::Duration;
 
 use crate::c2_wrapper::C2DecodeJob;
 use crate::c2_wrapper::C2DecodeWorkObject;
@@ -17,47 +25,54 @@ use crate::c2_wrapper::C2Status;
 use crate::c2_wrapper::C2Worker;
 use crate::c2_wrapper::Job;
 use crate::decoder::stateless::DecodeError;
+use crate::decoder::stateless::DynStatelessVideoDecoder;
 use crate::decoder::stateless::PoolLayer;
-use crate::decoder::stateless::StatelessVideoDecoder;
 use crate::decoder::DecodedHandle;
 use crate::decoder::DecoderEvent;
-use crate::decoder::FramePool;
 use crate::decoder::StreamInfo;
 use crate::image_processing::i4xx_copy;
 use crate::DecodedFormat;
 use crate::EncodedFormat;
 use crate::Fourcc;
 
-pub trait C2DecoderBackend<D, H, FP, U>
-where
-    H: DecodedHandle,
-    FP: FramePool<Descriptor = H::Descriptor> + ?Sized,
-    D: StatelessVideoDecoder<Handle = H, FramePool = FP> + ?Sized,
-{
-    fn new(options: U) -> Result<Self, String>
+#[derive(Debug, Error)]
+pub enum C2DecoderPollErrorWrapper {
+    #[error("failed to create Epoll: {0}")]
+    Epoll(Errno),
+    #[error("failed to add poll FDs to Epoll: {0}")]
+    EpollAdd(Errno),
+}
+
+pub trait C2DecoderBackend {
+    type DecodedHandle;
+    type DecoderOptions: Clone + Send + 'static;
+
+    fn new(options: Self::DecoderOptions) -> Result<Self, String>
     where
         Self: Sized;
-    fn get_decoder(&mut self, format: EncodedFormat) -> Result<Box<D>, String>;
+    // TODO: Support stateful video decoders.
+    fn get_decoder(
+        &mut self,
+        format: EncodedFormat,
+    ) -> Result<DynStatelessVideoDecoder<Self::DecodedHandle>, String>;
     fn allocate_new_frames(
         &mut self,
         stream_info: &StreamInfo,
         num_frames: usize,
-    ) -> Result<Vec<H::Descriptor>, String>;
+    ) -> Result<Vec<Self::DecodedHandle>, String>;
 }
 
-pub struct C2DecoderWorker<T, B, D, H, FP, U, E, W>
+pub struct C2DecoderWorker<B, T, E, W>
 where
+    B: C2DecoderBackend,
     T: C2DecodeWorkObject + Clone + Default + Send + 'static,
-    H: DecodedHandle,
-    FP: FramePool<Descriptor = H::Descriptor> + ?Sized,
-    D: StatelessVideoDecoder<Handle = H, FramePool = FP> + ?Sized,
-    B: C2DecoderBackend<D, H, FP, U>,
     E: FnMut(C2Status) + Send + 'static,
     W: FnMut(C2DecodeJob<T>) + Send + 'static,
-    U: Clone + Send + 'static,
 {
     backend: B,
-    decoder: Box<D>,
+    decoder: DynStatelessVideoDecoder<<B as C2DecoderBackend>::DecodedHandle>,
+    epoll_fd: Epoll,
+    awaiting_job_event: Arc<EventFd>,
     error_cb: Arc<Mutex<E>>,
     work_done_cb: Arc<Mutex<W>>,
     work_queue: Arc<Mutex<VecDeque<C2DecodeJob<T>>>>,
@@ -65,23 +80,14 @@ where
     in_flight_queue: VecDeque<C2DecodeJob<T>>,
     frame_num: u64,
     state: Arc<Mutex<C2State>>,
-    // TODO: Is this really the only way to fix the unconstrained type problem?
-    _phantom: PhantomData<(H, U)>,
-    // Tuples can't have more than one un-sized type, so we have to use this
-    // workaround.
-    __phantom: PhantomData<H>,
 }
 
-impl<T, B, D, H, FP, U, E, W> C2DecoderWorker<T, B, D, H, FP, U, E, W>
+impl<B, T, E, W> C2DecoderWorker<B, T, E, W>
 where
+    B: C2DecoderBackend,
     T: C2DecodeWorkObject + Clone + Default + Send + 'static,
-    B: C2DecoderBackend<D, H, FP, U>,
-    H: DecodedHandle,
-    FP: FramePool<Descriptor = H::Descriptor> + ?Sized,
-    D: StatelessVideoDecoder<Handle = H, FramePool = FP> + ?Sized,
     E: FnMut(C2Status) + Send + 'static,
     W: FnMut(C2DecodeJob<T>) + Send + 'static,
-    U: Clone + Send + 'static,
 {
     // Returns true if there were any events to process
     fn check_events(&mut self) -> bool {
@@ -199,31 +205,33 @@ where
     }
 }
 
-impl<T, B, D, H, FP, U, E, W> C2Worker<C2DecodeJob<T>, U, E, W>
-    for C2DecoderWorker<T, B, D, H, FP, U, E, W>
+impl<B, T, E, W> C2Worker<C2DecodeJob<T>, E, W> for C2DecoderWorker<B, T, E, W>
 where
+    B: C2DecoderBackend,
     T: C2DecodeWorkObject + Clone + Default + Send + 'static,
-    B: C2DecoderBackend<D, H, FP, U>,
-    H: DecodedHandle,
-    FP: FramePool<Descriptor = H::Descriptor> + ?Sized,
-    D: StatelessVideoDecoder<Handle = H, FramePool = FP> + ?Sized,
     E: FnMut(C2Status) + Send + 'static,
     W: FnMut(C2DecodeJob<T>) + Send + 'static,
-    U: Clone + Send + 'static,
 {
+    type Options = <B as C2DecoderBackend>::DecoderOptions;
+
     fn new(
         fourcc: Fourcc,
+        awaiting_job_event: Arc<EventFd>,
         error_cb: Arc<Mutex<E>>,
         work_done_cb: Arc<Mutex<W>>,
         work_queue: Arc<Mutex<VecDeque<C2DecodeJob<T>>>>,
         state: Arc<Mutex<C2State>>,
-        options: U,
+        options: Self::Options,
     ) -> Result<Self, String> {
         let mut backend = B::new(options)?;
         let decoder = backend.get_decoder(EncodedFormat::from(fourcc))?;
         Ok(Self {
             backend: backend,
             decoder: decoder,
+            epoll_fd: Epoll::new(EpollCreateFlags::empty())
+                .map_err(C2DecoderPollErrorWrapper::Epoll)
+                .unwrap(),
+            awaiting_job_event: awaiting_job_event,
             error_cb: error_cb,
             work_done_cb: work_done_cb,
             work_queue: work_queue,
@@ -231,21 +239,41 @@ where
             in_flight_queue: VecDeque::new(),
             frame_num: 0,
             state: state,
-            _phantom: Default::default(),
-            __phantom: Default::default(),
         })
     }
 
     fn process_loop(&mut self) {
+        self.epoll_fd
+            .add(
+                self.decoder.poll_fd(),
+                EpollEvent::new(EpollFlags::EPOLLIN, 1),
+            )
+            .map_err(C2DecoderPollErrorWrapper::EpollAdd)
+            .unwrap();
+        self.epoll_fd
+            .add(
+                self.awaiting_job_event.as_fd(),
+                EpollEvent::new(EpollFlags::EPOLLIN, 2),
+            )
+            .map_err(C2DecoderPollErrorWrapper::EpollAdd)
+            .unwrap();
+
         while *self.state.lock().unwrap() == C2State::C2Running {
-            let mut did_nothing = true;
+            // Poll for decoder events or pending job events.
+            let mut events = [EpollEvent::empty()];
+            self.epoll_fd.wait(&mut events, EpollTimeout::ZERO).unwrap();
+
+            if events == [EpollEvent::new(EpollFlags::EPOLLIN, 1)] {
+                self.awaiting_job_event.read().unwrap();
+            } else if events == [EpollEvent::new(EpollFlags::EPOLLIN, 2)] {
+                self.decoder.next_event();
+            }
 
             let mut pending_job: Option<C2DecodeJob<T>> = None;
             std::mem::swap(&mut self.pending_job, &mut pending_job);
             self.pending_job = match pending_job {
                 Some(mut job) => {
                     if job.is_drain() {
-                        did_nothing = false;
                         if let Err(_) = self.decoder.flush() {
                             log::debug!("Error handling drain request!");
                             *self.state.lock().unwrap() = C2State::C2Error;
@@ -258,7 +286,6 @@ where
                         let bitstream = job.work_object.input();
                         match self.decoder.decode(self.frame_num, bitstream) {
                             Ok(_) => {
-                                did_nothing = false;
                                 self.frame_num += 1;
                                 self.in_flight_queue.push_back(job);
                                 None
@@ -266,7 +293,6 @@ where
                             Err(DecodeError::CheckEvents)
                             | Err(DecodeError::NotEnoughOutputBuffers(_)) => Some(job),
                             Err(e) => {
-                                did_nothing = false;
                                 log::debug!("Unhandled error message from decoder {e:?}");
                                 *self.state.lock().unwrap() = C2State::C2Error;
                                 (*self.error_cb.lock().unwrap())(C2Status::C2BadValue);
@@ -277,20 +303,11 @@ where
                 }
                 None => {
                     let ret = (*self.work_queue.lock().unwrap()).pop_front();
-                    if ret.is_some() {
-                        did_nothing = false;
-                    }
                     ret
                 }
             };
 
-            did_nothing = !self.check_events() && did_nothing;
-
-            if did_nothing {
-                //TODO: Tune this value.
-                //TODO: Maybe we should come up with a way to make this async instead of polling?
-                thread::sleep(Duration::from_millis(10));
-            }
+            self.check_events();
         }
     }
 }

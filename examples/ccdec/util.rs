@@ -57,6 +57,7 @@ pub struct Args {
     pub output_format: DecodedFormat,
 
     /// origin of the memory for decoded buffers (managed, prime or user). Default: managed.
+    #[allow(dead_code)]
     #[argh(option, default = "FrameMemoryType::Managed")]
     pub frame_memory: FrameMemoryType,
 
@@ -69,10 +70,6 @@ pub struct Args {
     #[argh(option)]
     #[allow(dead_code)]
     pub libva_device: Option<PathBuf>,
-
-    /// whether to decode frames synchronously
-    #[argh(switch)]
-    pub synchronous: bool,
 
     /// whether to display the MD5 of the decoded stream, and at which granularity (stream or
     /// frame)

@@ -3,43 +3,51 @@
 // found in the LICENSE file.
 
 use crate::decoder::stateless::DecodeError;
+use crate::device::v4l2::stateless::queue::QueueError;
 use crate::device::v4l2::stateless::queue::V4l2CaptureBuffer;
 use crate::device::v4l2::stateless::queue::V4l2CaptureQueue;
-use crate::device::v4l2::stateless::queue::V4l2OutputBuffer;
 use crate::device::v4l2::stateless::queue::V4l2OutputQueue;
 use crate::device::v4l2::stateless::request::V4l2Request;
+use crate::video_frame::gbm_video_frame::GbmDevice;
+use crate::video_frame::VideoFrame;
 use crate::Fourcc;
 use crate::Rect;
 use crate::Resolution;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::os::fd::RawFd;
 use std::path::Path;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::thread::sleep;
+use std::time::Duration;
 
 use v4l2r::device::Device as VideoDevice;
 use v4l2r::device::DeviceConfig;
 use v4l2r::ioctl;
+use v4l2r::memory::DmaBufHandle;
+use v4l2r::memory::PlaneHandle;
 use v4l2r::nix::fcntl::open;
 use v4l2r::nix::fcntl::OFlag;
 use v4l2r::nix::sys::stat::Mode;
 
-//TODO: handle memory backends other than mmap
+//TODO: handle other memory backends for OUTPUT queue
 //TODO: handle video formats other than h264
 //TODO: handle queue start/stop at runtime
 //TODO: handle DRC at runtime
-struct DeviceHandle {
+struct DeviceHandle<C: PlaneHandle> {
     video_device: Arc<VideoDevice>,
     media_device: RawFd,
     output_queue: V4l2OutputQueue,
-    capture_queue: V4l2CaptureQueue,
-    capture_buffers: HashMap<u64, V4l2CaptureBuffer>,
+    capture_queue: V4l2CaptureQueue<C>,
+    capture_buffers: HashMap<u64, V4l2CaptureBuffer<C>>,
 }
 
-impl DeviceHandle {
+impl<C: PlaneHandle> DeviceHandle<C> {
     fn new() -> Self {
         // TODO: pass video device path and config via function arguments
         let video_device_path = Path::new("/dev/video-dec0");
@@ -63,48 +71,85 @@ impl DeviceHandle {
             media_device,
             output_queue,
             capture_queue,
-            capture_buffers: HashMap::<u64, V4l2CaptureBuffer>::new(),
+            capture_buffers: HashMap::<u64, V4l2CaptureBuffer<C>>::new(),
         }
     }
     fn alloc_request(&self) -> ioctl::Request {
         ioctl::Request::alloc(&self.media_device).expect("Failed to alloc request handle")
     }
-    fn alloc_buffer(&self) -> Result<V4l2OutputBuffer, DecodeError> {
-        self.output_queue.alloc_buffer()
+    fn dequeue_output_buffer(&self) {
+        let mut back_off_duration = Duration::from_millis(1);
+        loop {
+            match self.output_queue.dequeue_buffer() {
+                Ok(_) => {
+                    break;
+                }
+                Err(QueueError::Dequeue) => {
+                    sleep(back_off_duration);
+                    back_off_duration = back_off_duration + back_off_duration;
+                    continue;
+                }
+                Err(_) => panic!("handle this better"),
+            }
+        }
     }
-    fn sync(&mut self, timestamp: u64) -> V4l2CaptureBuffer {
+    fn dequeue_capture_buffer(
+        &mut self,
+        frame_import_cb: &impl Fn(
+            Fourcc,
+            Resolution,
+            Vec<usize>,
+            Vec<C>,
+        ) -> Box<dyn VideoFrame<NativeHandle = Vec<C>>>,
+    ) {
+        let mut back_off_duration = Duration::from_millis(1);
+        loop {
+            match self.capture_queue.dequeue_buffer(frame_import_cb) {
+                Ok(Some(buffer)) => {
+                    self.capture_buffers.insert(buffer.timestamp(), buffer);
+                    break;
+                }
+                _ => {
+                    sleep(back_off_duration);
+                    back_off_duration = back_off_duration + back_off_duration;
+                    continue;
+                }
+            }
+        }
+    }
+    fn sync(
+        &mut self,
+        timestamp: u64,
+        frame_import_cb: &impl Fn(
+            Fourcc,
+            Resolution,
+            Vec<usize>,
+            Vec<C>,
+        ) -> Box<dyn VideoFrame<NativeHandle = Vec<C>>>,
+    ) -> V4l2CaptureBuffer<C> {
         // TODO: handle synced buffers internally by capture queue
         loop {
             match self.capture_buffers.remove(&timestamp) {
                 Some(buffer) => return buffer,
-                _ => self.recycle_buffers(), // TODO: poll/select
+                _ => self.dequeue_capture_buffer(frame_import_cb),
             };
         }
-    }
-    fn recycle_buffers(&mut self) {
-        self.output_queue.drain();
-        // TODO: handle synced buffers internally by capture queue
-        loop {
-            match self.capture_queue.dequeue_buffer() {
-                Some(buffer) => {
-                    self.capture_buffers.insert(buffer.timestamp(), buffer);
-                }
-                _ => break,
-            }
-        }
-        self.capture_queue.refill();
     }
 }
 
 #[derive(Clone)]
 pub struct V4l2Device {
-    handle: Rc<RefCell<DeviceHandle>>,
+    handle: Rc<RefCell<DeviceHandle<DmaBufHandle<File>>>>,
+    gbm_device: Arc<GbmDevice>,
 }
 
 impl V4l2Device {
     pub fn new() -> Self {
         Self {
             handle: Rc::new(RefCell::new(DeviceHandle::new())),
+            // Hacky. This will go away once we properly plumb the Gralloc VideoFrames.
+            gbm_device: GbmDevice::open(PathBuf::from("/dev/dri/renderD128"))
+                .expect("Could not open GBM device!"),
         }
     }
     pub fn num_free_buffers(&self) -> usize {
@@ -131,7 +176,45 @@ impl V4l2Device {
         Ok(())
     }
     pub fn alloc_request(&self, timestamp: u64) -> Result<V4l2Request, DecodeError> {
-        let output_buffer = self.handle.borrow().alloc_buffer()?;
+        if self.handle.borrow().capture_queue.num_free_buffers() == 0 {
+            return Err(DecodeError::NotEnoughOutputBuffers(0));
+        }
+
+        let output_buffer = self.handle.borrow().output_queue.alloc_buffer();
+
+        let output_buffer = match output_buffer {
+            Ok(buffer) => buffer,
+            Err(DecodeError::NotEnoughOutputBuffers(_)) => {
+                self.handle.borrow_mut().dequeue_output_buffer();
+                match self.handle.borrow().output_queue.alloc_buffer() {
+                    Ok(buffer) => buffer,
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(error) => return Err(error),
+        };
+
+        // dequeue capture/output
+        let frame = Box::new(
+            self.gbm_device
+                .clone()
+                .new_frame(
+                    Fourcc::from(
+                        self.handle
+                            .borrow()
+                            .capture_queue
+                            .format
+                            .pixelformat
+                            .to_u32(),
+                    ),
+                    Resolution {
+                        width: self.handle.borrow().capture_queue.format.width,
+                        height: self.handle.borrow().capture_queue.format.height,
+                    },
+                )
+                .expect("Failed to allocate capture buffer!"),
+        );
+        self.handle.borrow().capture_queue.queue_buffer(frame)?;
 
         Ok(V4l2Request::new(
             self.clone(),
@@ -140,11 +223,23 @@ impl V4l2Device {
             output_buffer,
         ))
     }
-    pub fn sync(&self, timestamp: u64) -> V4l2CaptureBuffer {
-        self.handle.borrow_mut().sync(timestamp)
+    pub fn sync(&self, timestamp: u64) -> V4l2CaptureBuffer<DmaBufHandle<File>> {
+        self.handle.borrow_mut().sync(
+            timestamp,
+            &move |fourcc: Fourcc,
+                   resolution: Resolution,
+                   strides: Vec<usize>,
+                   native_handle: Vec<DmaBufHandle<File>>| {
+                Box::new(
+                    <Arc<GbmDevice> as Clone>::clone(&self.gbm_device)
+                        .import_from_v4l2(fourcc, resolution, strides, native_handle)
+                        .expect("Failed to import V4L2 handles!"),
+                )
+            },
+        )
     }
     pub fn recycle_buffers(&self) {
-        self.handle.borrow_mut().recycle_buffers()
+        //self.handle.borrow_mut().recycle_buffers()
     }
 }
 

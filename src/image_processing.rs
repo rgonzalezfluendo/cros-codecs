@@ -2,12 +2,20 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::cmp::min;
+
+use crate::video_frame::{VideoFrame, UV_PLANE, U_PLANE, V_PLANE, Y_PLANE};
+use crate::DecodedFormat;
+
 /// TODO(greenjustin): This entire file should be replaced with LibYUV.
 use byteorder::ByteOrder;
 use byteorder::LittleEndian;
 
-/// TODO(greenjustin): Refactor image processing function parameters to follow the same order as
-/// LibYUV.
+#[cfg(feature = "v4l2")]
+use std::arch::aarch64::*;
+
+pub const MM21_TILE_WIDTH: usize = 16;
+pub const MM21_TILE_HEIGHT: usize = 32;
 
 /// Copies `src` into `dst` as NV12, handling padding.
 pub fn nv12_copy(
@@ -169,32 +177,77 @@ pub fn y410_to_i410(
     }
 }
 
-/// Simple implementation of MM21 to NV12 detiling. Note that this Rust-only implementation is
-/// unlikely to be fast enough for production code, and is for testing purposes only.
-/// TODO(b:380280455): We will want to speed this up and also add MT2T support.
+#[cfg(feature = "v4l2")]
+pub fn detile_row(mut src: *const u8, src_tile_stride: isize, mut dst: *mut u8, width: usize) {
+    let mut w = width;
+    while w > 0 {
+        // Verified all parameters before calling these.
+        unsafe {
+            let v0: uint8x16_t = vld1q_u8(src);
+            src = src.offset(src_tile_stride as isize);
+            w = w - MM21_TILE_WIDTH;
+            vst1q_u8(dst, v0);
+            dst = dst.offset(MM21_TILE_WIDTH as isize);
+        }
+    }
+}
+
+// Detiles a plane of data using implementation from LibYUV::DetilePlane.
+#[cfg(feature = "v4l2")]
 pub fn detile_plane(
     src: &[u8],
+    src_stride: usize,
     dst: &mut [u8],
+    mut dst_stride: isize,
     width: usize,
-    height: usize,
-    tile_width: usize,
+    mut height: isize,
     tile_height: usize,
 ) -> Result<(), String> {
-    if width % tile_width != 0 || height % tile_height != 0 {
-        return Err("Buffers must be aligned to tile dimensions for detiling".to_owned());
+    let src_tile_stride = (16 * tile_height) as isize;
+
+    if width <= 0 || height == 0 || (((tile_height) & ((tile_height) - 1)) > 0) {
+        return Err("Invalid width, height, or tile height is not a power of 2.".to_owned());
     }
 
-    let tile_size = tile_width * tile_height;
-    let mut output_idx = 0;
-    for y_start in (0..height).step_by(tile_height) {
-        let tile_row_start = y_start * width;
-        for y in 0..tile_height {
-            let row_start = tile_row_start + y * tile_width;
-            for x in (0..width).step_by(tile_width) {
-                let input_idx = row_start + x / tile_width * tile_size;
-                dst[output_idx..(output_idx + tile_width)]
-                    .copy_from_slice(&src[input_idx..(input_idx + tile_width)]);
-                output_idx += tile_width;
+    if (width & (MM21_TILE_WIDTH - 1)) > 0 {
+        return Err("Width not aligned properly to tile width.".to_owned());
+    }
+
+    if src.len() < (src_stride * (height as usize)) {
+        return Err("Src buffer not big enough.".to_owned());
+    }
+
+    if dst.len() < (dst_stride * height) as usize {
+        return Err("Dst buffer not big enough.".to_owned());
+    }
+
+    let mut src_ptr = src.as_ptr();
+    let mut dst_ptr = dst.as_mut_ptr();
+
+    // Image inversion
+    if height < 0 {
+        height = -height;
+        // Verified the validity of src buffer and height.
+        unsafe {
+            src_ptr = src_ptr.offset(((height - 1) * dst_stride) as isize);
+        }
+        dst_stride = -dst_stride;
+    }
+
+    // Detile Plane
+    for y in 0..height {
+        // For testing purposes we are using the DETILE_ROW_NEON
+        detile_row(src_ptr, src_tile_stride, dst_ptr, width);
+        // Verified the validity of the src and dst buffers.
+        unsafe {
+            dst_ptr = dst_ptr.offset(dst_stride as isize);
+            src_ptr = src_ptr.offset(MM21_TILE_WIDTH as isize);
+        }
+        // Advance to next row of tiles.
+        if (y & (tile_height - 1) as isize) == ((tile_height - 1) as isize) {
+            // Verified validity of the src buffers.
+            unsafe {
+                src_ptr = src_ptr.offset(-src_tile_stride + (src_stride * tile_height) as isize);
             }
         }
     }
@@ -202,31 +255,45 @@ pub fn detile_plane(
     Ok(())
 }
 
-pub const MM21_TILE_WIDTH: usize = 16;
-pub const MM21_TILE_HEIGHT: usize = 32;
-
+// Converts MM21 to NV12 using the implementation from LibYUV::MM21ToNV12.
+#[cfg(feature = "v4l2")]
 pub fn mm21_to_nv12(
     src_y: &[u8],
+    src_stride_y: usize,
     dst_y: &mut [u8],
+    dst_stride_y: usize,
     src_uv: &[u8],
+    src_stride_uv: usize,
     dst_uv: &mut [u8],
+    dst_stride_uv: usize,
     width: usize,
-    height: usize,
+    height: isize,
 ) -> Result<(), String> {
+    if width <= 0 {
+        return Err("Width must be greater than 0.".to_owned());
+    }
+
+    let sign = if height < 0 { -1 } else { 1 };
+
+    // Detile Plane Y
     detile_plane(
         src_y,
+        src_stride_y,
         dst_y,
+        dst_stride_y as isize,
         width,
         height,
-        MM21_TILE_WIDTH,
         MM21_TILE_HEIGHT,
     )?;
+
+    // Detile Plane UV
     detile_plane(
         src_uv,
+        src_stride_uv,
         dst_uv,
-        width,
-        height / 2,
-        MM21_TILE_WIDTH,
+        dst_stride_uv as isize,
+        (width + 1) & !1,
+        (height + sign) / 2,
         MM21_TILE_HEIGHT / 2,
     )
 }
@@ -278,11 +345,114 @@ pub fn i420_to_nv12(src_y: &[u8], dst_y: &mut [u8], src_u: &[u8], src_v: &[u8], 
     i420_to_nv12_chroma(src_u, src_v, dst_uv);
 }
 
+// TODO: Add more conversions. All supported conversion functions need to take stride parameters.
+pub const SUPPORTED_CONVERSION: [(DecodedFormat, DecodedFormat); 4] = [
+    (DecodedFormat::NV12, DecodedFormat::NV12),
+    (DecodedFormat::I420, DecodedFormat::I420),
+    (DecodedFormat::I422, DecodedFormat::I422),
+    (DecodedFormat::I444, DecodedFormat::I444),
+];
+
+pub fn convert_video_frame(src: &impl VideoFrame, dst: &mut impl VideoFrame) -> Result<(), String> {
+    let width = min(dst.resolution().width, src.resolution().width) as usize;
+    let height = min(dst.resolution().height, src.resolution().height) as usize;
+
+    let conversion = (src.decoded_format()?, dst.decoded_format()?);
+    let src_pitches = src.get_plane_pitch();
+    let src_mapping = src.map().expect("Image processor src mapping failed!");
+    let src_planes = src_mapping.get();
+    let dst_pitches = dst.get_plane_pitch();
+    let dst_mapping = dst.map_mut().expect("Image processor dst mapping failed!");
+    let dst_planes = dst_mapping.get();
+    match conversion {
+        (DecodedFormat::NV12, DecodedFormat::NV12) => {
+            nv12_copy(
+                src_planes[Y_PLANE],
+                src_pitches[Y_PLANE],
+                *dst_planes[Y_PLANE].borrow_mut(),
+                dst_pitches[Y_PLANE],
+                src_planes[UV_PLANE],
+                src_pitches[UV_PLANE],
+                *dst_planes[UV_PLANE].borrow_mut(),
+                dst_pitches[UV_PLANE],
+                width,
+                height,
+            );
+            Ok(())
+        }
+        (DecodedFormat::I420, DecodedFormat::I420) => {
+            i4xx_copy(
+                src_planes[Y_PLANE],
+                src_pitches[Y_PLANE],
+                *dst_planes[Y_PLANE].borrow_mut(),
+                dst_pitches[Y_PLANE],
+                src_planes[U_PLANE],
+                src_pitches[U_PLANE],
+                *dst_planes[U_PLANE].borrow_mut(),
+                dst_pitches[U_PLANE],
+                src_planes[V_PLANE],
+                src_pitches[V_PLANE],
+                *dst_planes[V_PLANE].borrow_mut(),
+                dst_pitches[V_PLANE],
+                width,
+                height,
+                (true, true),
+            );
+            Ok(())
+        }
+        (DecodedFormat::I422, DecodedFormat::I422) => {
+            i4xx_copy(
+                src_planes[Y_PLANE],
+                src_pitches[Y_PLANE],
+                *dst_planes[Y_PLANE].borrow_mut(),
+                dst_pitches[Y_PLANE],
+                src_planes[U_PLANE],
+                src_pitches[U_PLANE],
+                *dst_planes[U_PLANE].borrow_mut(),
+                dst_pitches[U_PLANE],
+                src_planes[V_PLANE],
+                src_pitches[V_PLANE],
+                *dst_planes[V_PLANE].borrow_mut(),
+                dst_pitches[V_PLANE],
+                width,
+                height,
+                (true, false),
+            );
+            Ok(())
+        }
+        (DecodedFormat::I444, DecodedFormat::I444) => {
+            i4xx_copy(
+                src_planes[Y_PLANE],
+                src_pitches[Y_PLANE],
+                *dst_planes[Y_PLANE].borrow_mut(),
+                dst_pitches[Y_PLANE],
+                src_planes[U_PLANE],
+                src_pitches[U_PLANE],
+                *dst_planes[U_PLANE].borrow_mut(),
+                dst_pitches[U_PLANE],
+                src_planes[V_PLANE],
+                src_pitches[V_PLANE],
+                *dst_planes[V_PLANE].borrow_mut(),
+                dst_pitches[V_PLANE],
+                width,
+                height,
+                (false, false),
+            );
+            Ok(())
+        }
+        _ => Err(format!(
+            "Unsupported conversion {:?} -> {:?}",
+            conversion.0, conversion.1
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "v4l2")]
     fn test_mm21_to_nv12() {
         let test_input = include_bytes!("test_data/puppets-480x270_20230825.mm21.yuv");
         let test_expected_output = include_bytes!("test_data/puppets-480x270_20230825.nv12.yuv");
@@ -291,9 +461,13 @@ mod tests {
         let (test_y_output, test_uv_output) = test_output.split_at_mut(480 * 288);
         mm21_to_nv12(
             &test_input[0..480 * 288],
+            480,
             test_y_output,
+            480,
             &test_input[480 * 288..480 * 288 * 3 / 2],
+            480,
             test_uv_output,
+            480,
             480,
             288,
         )
