@@ -63,6 +63,11 @@ impl StatelessVp9DecoderBackend for V4l2StatelessDecoderBackend {
             Ok(buffer) => buffer,
             _ => return Err(NewPictureError::OutOfOutputBuffers),
         };
+        let picture = Rc::new(RefCell::new(V4l2Picture::new(request_buffer.clone())));
+        request_buffer
+            .as_ref()
+            .borrow_mut()
+            .set_picture_ref(Rc::<RefCell<V4l2Picture>>::downgrade(&picture));
         Ok(Rc::new(RefCell::new(V4l2Picture::new(request_buffer))))
     }
 
@@ -76,8 +81,11 @@ impl StatelessVp9DecoderBackend for V4l2StatelessDecoderBackend {
     ) -> StatelessBackendResult<Self::Handle> {
         let mut ctrl = Vp9V4l2Control::from(hdr);
 
+        let request = picture.borrow_mut().request();
+        let mut request = request.as_ref().borrow_mut();
+
         // We have to do this manually since v4l2r does not directly support VP9
-        let which = picture.borrow_mut().request().which();
+        let which = request.which();
         ioctl::s_ext_ctrls(&self.device, which, &mut ctrl).expect("Failed to set output control");
 
         let handle = Rc::new(RefCell::new(BackendHandle {
@@ -93,9 +101,8 @@ impl StatelessVp9DecoderBackend for V4l2StatelessDecoderBackend {
         }
         picture.borrow_mut().set_ref_pictures(reference_pictures);
 
-        picture.borrow_mut().request().write(bitstream);
-
-        picture.borrow_mut().request().submit();
+        request.write(bitstream);
+        request.submit();
 
         Ok(V4l2StatelessDecoderHandle {
             handle: handle,

@@ -5,13 +5,14 @@
 use std::cell::RefCell;
 use std::fs::File;
 use std::os::fd::AsRawFd;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use v4l2r::controls::ExtControlTrait;
 use v4l2r::controls::SafeExtControl;
 use v4l2r::ioctl;
 use v4l2r::memory::DmaBufHandle;
 
+use crate::backend::v4l2::decoder::stateless::V4l2Picture;
 use crate::device::v4l2::stateless::device::V4l2Device;
 use crate::device::v4l2::stateless::queue::V4l2CaptureBuffer;
 use crate::device::v4l2::stateless::queue::V4l2OutputBuffer;
@@ -20,7 +21,8 @@ struct InitRequestHandle {
     device: V4l2Device,
     timestamp: u64,
     handle: ioctl::Request,
-    buffer: V4l2OutputBuffer,
+    output_buffer: V4l2OutputBuffer,
+    picture: Weak<RefCell<V4l2Picture>>,
 }
 
 impl InitRequestHandle {
@@ -28,13 +30,14 @@ impl InitRequestHandle {
         device: V4l2Device,
         timestamp: u64,
         handle: ioctl::Request,
-        buffer: V4l2OutputBuffer,
+        output_buffer: V4l2OutputBuffer,
     ) -> Self {
         Self {
             device,
             timestamp,
             handle,
-            buffer,
+            output_buffer,
+            picture: Weak::new(),
         }
     }
     fn which(&self) -> ioctl::CtrlWhich {
@@ -51,42 +54,47 @@ impl InitRequestHandle {
         self
     }
     fn write(&mut self, data: &[u8]) -> &mut Self {
-        self.buffer.write(data);
+        self.output_buffer.write(data);
         self
     }
     fn submit(self) -> PendingRequestHandle {
-        self.buffer
+        self.output_buffer
             .submit(self.timestamp, self.handle.as_raw_fd())
             .expect("error needs handling");
         self.handle.queue().expect("Failed to queue request handle");
         PendingRequestHandle {
             device: self.device.clone(),
             timestamp: self.timestamp,
+            picture: self.picture,
         }
+    }
+    fn set_picture_ref(&mut self, picture: Weak<RefCell<V4l2Picture>>) {
+        self.picture = picture;
     }
 }
 
 struct PendingRequestHandle {
     device: V4l2Device,
     timestamp: u64,
+    picture: Weak<RefCell<V4l2Picture>>,
 }
 
 impl PendingRequestHandle {
     fn sync(self) -> DoneRequestHandle {
         DoneRequestHandle {
-            buffer: Rc::new(RefCell::new(self.device.sync(self.timestamp))),
+            capture_buffer: Rc::new(RefCell::new(self.device.sync(self.timestamp))),
         }
     }
 }
 
 struct DoneRequestHandle {
-    buffer: Rc<RefCell<V4l2CaptureBuffer<DmaBufHandle<File>>>>,
+    capture_buffer: Rc<RefCell<V4l2CaptureBuffer<DmaBufHandle<File>>>>,
 }
 
 impl DoneRequestHandle {
     fn result(&self) -> V4l2Result {
         V4l2Result {
-            buffer: self.buffer.clone(),
+            capture_buffer: self.capture_buffer.clone(),
         }
     }
 }
@@ -105,15 +113,20 @@ impl RequestHandle {
         device: V4l2Device,
         timestamp: u64,
         handle: ioctl::Request,
-        buffer: V4l2OutputBuffer,
+        output_buffer: V4l2OutputBuffer,
     ) -> Self {
-        Self::Init(InitRequestHandle::new(device, timestamp, handle, buffer))
+        Self::Init(InitRequestHandle::new(
+            device,
+            timestamp,
+            handle,
+            output_buffer,
+        ))
     }
     fn timestamp(&self) -> u64 {
         match self {
             Self::Init(handle) => handle.timestamp,
             Self::Pending(handle) => handle.timestamp,
-            Self::Done(handle) => handle.buffer.borrow().timestamp(),
+            Self::Done(handle) => handle.capture_buffer.borrow().timestamp(),
             _ => panic!("ERROR"),
         }
     }
@@ -163,6 +176,18 @@ impl RequestHandle {
             _ => panic!("ERROR"),
         }
     }
+    fn set_picture_ref(&mut self, picture: Weak<RefCell<V4l2Picture>>) {
+        match self {
+            Self::Init(handle) => handle.set_picture_ref(picture),
+            _ => panic!("ERROR"),
+        }
+    }
+    fn picture(&mut self) -> Weak<RefCell<V4l2Picture>> {
+        match self {
+            Self::Pending(handle) => handle.picture.clone(),
+            _ => panic!("ERROR"),
+        }
+    }
 }
 
 pub struct V4l2Request(RequestHandle);
@@ -172,9 +197,9 @@ impl V4l2Request {
         device: V4l2Device,
         timestamp: u64,
         handle: ioctl::Request,
-        buffer: V4l2OutputBuffer,
+        output_buffer: V4l2OutputBuffer,
     ) -> Self {
-        Self(RequestHandle::new(device, timestamp, handle, buffer))
+        Self(RequestHandle::new(device, timestamp, handle, output_buffer))
     }
     pub fn timestamp(&self) -> u64 {
         self.0.timestamp()
@@ -203,17 +228,23 @@ impl V4l2Request {
     pub fn result(&self) -> V4l2Result {
         self.0.result()
     }
+    pub fn set_picture_ref(&mut self, picture: Weak<RefCell<V4l2Picture>>) {
+        self.0.set_picture_ref(picture);
+    }
+    pub fn picture(&mut self) -> Weak<RefCell<V4l2Picture>> {
+        self.0.picture()
+    }
 }
 
 pub struct V4l2Result {
-    buffer: Rc<RefCell<V4l2CaptureBuffer<DmaBufHandle<File>>>>,
+    capture_buffer: Rc<RefCell<V4l2CaptureBuffer<DmaBufHandle<File>>>>,
 }
 
 impl V4l2Result {
     pub fn length(&self) -> usize {
-        self.buffer.borrow().length()
+        self.capture_buffer.borrow().length()
     }
     pub fn read(&self, data: &mut [u8]) {
-        self.buffer.borrow().read(data)
+        self.capture_buffer.borrow().read(data)
     }
 }

@@ -2,26 +2,12 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use crate::decoder::stateless::DecodeError;
-use crate::device::v4l2::stateless::queue::QueueError;
-use crate::device::v4l2::stateless::queue::V4l2CaptureBuffer;
-use crate::device::v4l2::stateless::queue::V4l2CaptureQueue;
-use crate::device::v4l2::stateless::queue::V4l2OutputQueue;
-use crate::device::v4l2::stateless::request::V4l2Request;
-use crate::video_frame::gbm_video_frame::GbmDevice;
-use crate::video_frame::VideoFrame;
-use crate::Fourcc;
-use crate::Rect;
-use crate::Resolution;
-
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
-use std::os::fd::AsRawFd;
-use std::os::fd::RawFd;
-use std::path::Path;
-use std::path::PathBuf;
-use std::rc::Rc;
+use std::os::fd::{AsRawFd, RawFd};
+use std::path::{Path, PathBuf};
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
@@ -35,6 +21,18 @@ use v4l2r::nix::fcntl::open;
 use v4l2r::nix::fcntl::OFlag;
 use v4l2r::nix::sys::stat::Mode;
 
+use crate::decoder::stateless::DecodeError;
+use crate::device::v4l2::stateless::queue::QueueError;
+use crate::device::v4l2::stateless::queue::V4l2CaptureBuffer;
+use crate::device::v4l2::stateless::queue::V4l2CaptureQueue;
+use crate::device::v4l2::stateless::queue::V4l2OutputQueue;
+use crate::device::v4l2::stateless::request::V4l2Request;
+use crate::video_frame::gbm_video_frame::GbmDevice;
+use crate::video_frame::VideoFrame;
+use crate::Fourcc;
+use crate::Rect;
+use crate::Resolution;
+
 //TODO: handle other memory backends for OUTPUT queue
 //TODO: handle video formats other than h264
 //TODO: handle queue start/stop at runtime
@@ -45,6 +43,7 @@ struct DeviceHandle<C: PlaneHandle> {
     output_queue: V4l2OutputQueue,
     capture_queue: V4l2CaptureQueue<C>,
     capture_buffers: HashMap<u64, V4l2CaptureBuffer<C>>,
+    requests: HashMap<u64, Weak<RefCell<V4l2Request>>>,
 }
 
 impl<C: PlaneHandle> DeviceHandle<C> {
@@ -72,6 +71,7 @@ impl<C: PlaneHandle> DeviceHandle<C> {
             output_queue,
             capture_queue,
             capture_buffers: HashMap::<u64, V4l2CaptureBuffer<C>>::new(),
+            requests: HashMap::<u64, Weak<RefCell<V4l2Request>>>::new(),
         }
     }
     fn alloc_request(&self) -> ioctl::Request {
@@ -84,7 +84,7 @@ impl<C: PlaneHandle> DeviceHandle<C> {
                 Ok(_) => {
                     break;
                 }
-                Err(QueueError::Dequeue) => {
+                Err(QueueError::BufferDequeue) => {
                     sleep(back_off_duration);
                     back_off_duration = back_off_duration + back_off_duration;
                     continue;
@@ -93,7 +93,11 @@ impl<C: PlaneHandle> DeviceHandle<C> {
             }
         }
     }
-    fn dequeue_capture_buffer(
+    fn insert_request_into_hash(&mut self, request: Weak<RefCell<V4l2Request>>) {
+        let timestamp = request.upgrade().unwrap().as_ref().borrow().timestamp();
+        self.requests.insert(timestamp, request);
+    }
+    fn try_dequeue_capture_buffers(
         &mut self,
         frame_import_cb: &impl Fn(
             Fourcc,
@@ -102,18 +106,25 @@ impl<C: PlaneHandle> DeviceHandle<C> {
             Vec<C>,
         ) -> Box<dyn VideoFrame<NativeHandle = Vec<C>>>,
     ) {
-        let mut back_off_duration = Duration::from_millis(1);
         loop {
             match self.capture_queue.dequeue_buffer(frame_import_cb) {
                 Ok(Some(buffer)) => {
-                    self.capture_buffers.insert(buffer.timestamp(), buffer);
-                    break;
-                }
-                _ => {
-                    sleep(back_off_duration);
-                    back_off_duration = back_off_duration + back_off_duration;
+                    let timestamp = buffer.timestamp();
+                    self.capture_buffers.insert(timestamp, buffer);
+                    let request = self.requests.remove(&timestamp).unwrap();
+                    match request.upgrade().unwrap().as_ref().try_borrow_mut() {
+                        Ok(mut request) => request
+                            .picture()
+                            .upgrade()
+                            .unwrap()
+                            .as_ref()
+                            .borrow_mut()
+                            .drop_references(),
+                        _ => (),
+                    }
                     continue;
                 }
+                _ => break,
             }
         }
     }
@@ -128,11 +139,20 @@ impl<C: PlaneHandle> DeviceHandle<C> {
         ) -> Box<dyn VideoFrame<NativeHandle = Vec<C>>>,
     ) -> V4l2CaptureBuffer<C> {
         // TODO: handle synced buffers internally by capture queue
+        let mut back_off_duration = Duration::from_millis(1);
+        let time_out = Duration::from_millis(120);
         loop {
             match self.capture_buffers.remove(&timestamp) {
                 Some(buffer) => return buffer,
-                _ => self.dequeue_capture_buffer(frame_import_cb),
-            };
+                _ => {
+                    sleep(back_off_duration);
+                    back_off_duration = back_off_duration + back_off_duration;
+                    self.try_dequeue_capture_buffers(frame_import_cb);
+                    if back_off_duration > time_out {
+                        panic!("unable to dequeue frame");
+                    }
+                }
+            }
         }
     }
 }
@@ -175,7 +195,7 @@ impl V4l2Device {
             .initialize(visible_rect, num_buffers)?;
         Ok(())
     }
-    pub fn alloc_request(&self, timestamp: u64) -> Result<V4l2Request, DecodeError> {
+    pub fn alloc_request(&self, timestamp: u64) -> Result<Rc<RefCell<V4l2Request>>, DecodeError> {
         if self.handle.borrow().capture_queue.num_free_buffers() == 0 {
             return Err(DecodeError::NotEnoughOutputBuffers(0));
         }
@@ -194,7 +214,6 @@ impl V4l2Device {
             Err(error) => return Err(error),
         };
 
-        // dequeue capture/output
         let frame = Box::new(
             self.gbm_device
                 .clone()
@@ -215,13 +234,31 @@ impl V4l2Device {
                 .expect("Failed to allocate capture buffer!"),
         );
         self.handle.borrow().capture_queue.queue_buffer(frame)?;
+        self.handle
+            .borrow_mut()
+            .try_dequeue_capture_buffers(
+                &move |fourcc: Fourcc,
+                       resolution: Resolution,
+                       strides: Vec<usize>,
+                       native_handle: Vec<DmaBufHandle<File>>| {
+                    Box::new(
+                        <Arc<GbmDevice> as Clone>::clone(&self.gbm_device)
+                            .import_from_v4l2(fourcc, resolution, strides, native_handle)
+                            .expect("Failed to import V4L2 handles!"),
+                    )
+                },
+            );
 
-        Ok(V4l2Request::new(
+        let request = Rc::new(RefCell::new(V4l2Request::new(
             self.clone(),
             timestamp,
             self.handle.borrow().alloc_request(),
             output_buffer,
-        ))
+        )));
+        self.handle
+            .borrow_mut()
+            .insert_request_into_hash(Rc::downgrade(&request.clone()));
+        Ok(request)
     }
     pub fn sync(&self, timestamp: u64) -> V4l2CaptureBuffer<DmaBufHandle<File>> {
         self.handle.borrow_mut().sync(
@@ -237,9 +274,6 @@ impl V4l2Device {
                 )
             },
         )
-    }
-    pub fn recycle_buffers(&self) {
-        //self.handle.borrow_mut().recycle_buffers()
     }
 }
 
