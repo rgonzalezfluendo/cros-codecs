@@ -12,8 +12,9 @@ use crate::decoder::stateless::DynStatelessVideoDecoder;
 use crate::decoder::stateless::StatelessDecoder;
 use crate::decoder::stateless::StatelessVideoDecoder;
 use crate::decoder::BlockingMode;
-use crate::decoder::StreamInfo;
+use crate::video_frame::VideoFrame;
 use crate::EncodedFormat;
+use crate::Fourcc;
 
 #[derive(Clone, Debug)]
 pub struct C2V4L2DecoderOptions {
@@ -24,17 +25,21 @@ pub struct C2V4L2DecoderOptions {
 pub struct C2V4L2Decoder {}
 
 impl C2DecoderBackend for C2V4L2Decoder {
-    type DecodedHandle = ();
     type DecoderOptions = C2V4L2DecoderOptions;
 
     fn new(_options: C2V4L2DecoderOptions) -> Result<Self, String> {
         Ok(Self {})
     }
 
-    fn get_decoder(
+    // TODO: Actually query the driver for this information.
+    fn supported_output_formats(&self) -> Vec<Fourcc> {
+        vec![Fourcc::from(b"MM21")]
+    }
+
+    fn get_decoder<V: VideoFrame + 'static>(
         &mut self,
         format: EncodedFormat,
-    ) -> Result<DynStatelessVideoDecoder<Self::DecodedHandle>, String> {
+    ) -> Result<DynStatelessVideoDecoder<V>, String> {
         Ok(match format {
             EncodedFormat::H264 => {
                 StatelessDecoder::<H264, _>::new_v4l2(BlockingMode::NonBlocking).into_trait_object()
@@ -47,13 +52,5 @@ impl C2DecoderBackend for C2V4L2Decoder {
             }
             _ => return Err(format!("Unsupported format {format:?}")),
         })
-    }
-
-    fn allocate_new_frames(
-        &mut self,
-        _stream_info: &StreamInfo,
-        num_frames: usize,
-    ) -> Result<Vec<Self::DecodedHandle>, String> {
-        Ok(vec![(); num_frames])
     }
 }

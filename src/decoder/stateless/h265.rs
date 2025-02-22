@@ -31,14 +31,12 @@ use crate::codec::h265::picture::Reference;
 use crate::decoder::stateless::DecodeError;
 use crate::decoder::stateless::DecodingState;
 use crate::decoder::stateless::NewPictureResult;
-use crate::decoder::stateless::PoolLayer;
 use crate::decoder::stateless::StatelessBackendResult;
 use crate::decoder::stateless::StatelessCodec;
 use crate::decoder::stateless::StatelessDecoder;
 use crate::decoder::stateless::StatelessDecoderBackend;
 use crate::decoder::stateless::StatelessDecoderBackendPicture;
 use crate::decoder::stateless::StatelessVideoDecoder;
-use crate::decoder::stateless::TryFormat;
 use crate::decoder::BlockingMode;
 use crate::decoder::DecodedHandle;
 use crate::decoder::DecoderEvent;
@@ -56,8 +54,10 @@ pub trait StatelessH265DecoderBackend:
     /// Called when the decoder determines that a frame or field was found.
     fn new_picture(
         &mut self,
-        coded_resolution: Resolution,
         timestamp: u64,
+        alloc_cb: &mut dyn FnMut() -> Option<
+            <<Self as StatelessDecoderBackend>::Handle as DecodedHandle>::Frame,
+        >,
     ) -> NewPictureResult<Self::Picture>;
 
     /// Called by the decoder for every frame or field found.
@@ -455,7 +455,7 @@ impl StatelessCodec for H265 {
 
 impl<B> StatelessDecoder<H265, B>
 where
-    B: StatelessH265DecoderBackend + TryFormat<H265>,
+    B: StatelessH265DecoderBackend,
     B::Handle: Clone,
 {
     /// Whether the stream parameters have changed, indicating that a negotiation window has opened.
@@ -833,6 +833,7 @@ where
         &mut self,
         timestamp: u64,
         slice: &Slice,
+        alloc_cb: &mut dyn FnMut() -> Option<<B::Handle as DecodedHandle>::Frame>,
     ) -> Result<Option<CurrentPicState<B::Handle, B::Picture>>, DecodeError> {
         self.update_current_set_ids(slice.header.pic_parameter_set_id)?;
         self.renegotiate_if_needed(RenegotiationType::CurrentSps)?;
@@ -841,7 +842,7 @@ where
             return Err(DecodeError::CheckEvents);
         }
 
-        let mut backend_pic = self.backend.new_picture(self.coded_resolution, timestamp)?;
+        let mut backend_pic = self.backend.new_picture(timestamp, alloc_cb)?;
 
         let pic = PictureData::new_from_slice(
             slice,
@@ -1006,7 +1007,12 @@ where
         Ok(())
     }
 
-    fn process_nalu(&mut self, timestamp: u64, nalu: Nalu) -> Result<(), DecodeError> {
+    fn process_nalu(
+        &mut self,
+        timestamp: u64,
+        nalu: Nalu,
+        alloc_cb: &mut dyn FnMut() -> Option<<B::Handle as DecodedHandle>::Frame>,
+    ) -> Result<(), DecodeError> {
         log::debug!("Processing NALU {:?}, length is {}", nalu.header.type_, nalu.size);
 
         match nalu.header.type_ {
@@ -1076,10 +1082,10 @@ where
 
                 let cur_pic = match self.codec.current_pic.take() {
                     // No current picture, start a new one.
-                    None => self.begin_picture(timestamp, &slice)?,
+                    None => self.begin_picture(timestamp, &slice, alloc_cb)?,
                     Some(cur_pic) if first_slice_segment_in_pic_flag => {
                         self.finish_picture(cur_pic)?;
-                        self.begin_picture(timestamp, &slice)?
+                        self.begin_picture(timestamp, &slice, alloc_cb)?
                     }
                     Some(cur_pic) => Some(cur_pic),
                 };
@@ -1121,13 +1127,19 @@ where
 
 impl<B> StatelessVideoDecoder for StatelessDecoder<H265, B>
 where
-    B: StatelessH265DecoderBackend + TryFormat<H265>,
+    B: StatelessH265DecoderBackend,
     B::Handle: Clone + 'static,
 {
     type Handle = B::Handle;
-    type FramePool = B::FramePool;
 
-    fn decode(&mut self, timestamp: u64, bitstream: &[u8]) -> Result<usize, DecodeError> {
+    fn decode(
+        &mut self,
+        timestamp: u64,
+        bitstream: &[u8],
+        alloc_cb: &mut dyn FnMut() -> Option<
+            <<B as StatelessDecoderBackend>::Handle as DecodedHandle>::Frame,
+        >,
+    ) -> Result<usize, DecodeError> {
         let mut cursor = Cursor::new(bitstream);
         let nalu = Nalu::next(&mut cursor).map_err(|err| DecodeError::ParseFrameError(err))?;
 
@@ -1167,13 +1179,13 @@ where
                     nalu.header.type_,
                     NaluType::VpsNut | NaluType::SpsNut | NaluType::PpsNut
                 ) {
-                    self.process_nalu(timestamp, nalu)?;
+                    self.process_nalu(timestamp, nalu, alloc_cb)?;
                 }
             }
             // Ask the client to confirm the format before we can process this.
             DecodingState::AwaitingFormat(_) => return Err(DecodeError::CheckEvents),
             DecodingState::Decoding => {
-                self.process_nalu(timestamp, nalu)?;
+                self.process_nalu(timestamp, nalu, alloc_cb)?;
             }
         }
 
@@ -1194,10 +1206,6 @@ where
             // TODO: unwrap this for now, but ideally change this closure to return Result
             decoder.apply_sps(sps).unwrap();
         })
-    }
-
-    fn frame_pool(&mut self, layer: PoolLayer) -> Vec<&mut B::FramePool> {
-        self.backend.frame_pool(layer)
     }
 
     fn stream_info(&self) -> Option<&StreamInfo> {

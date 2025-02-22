@@ -7,12 +7,9 @@ use std::rc::Rc;
 use anyhow::anyhow;
 use anyhow::Context;
 use libva::Display;
-use libva::Picture as VaPicture;
 use libva::SegmentParameterVP9;
-use libva::SurfaceMemoryDescriptor;
 
 use crate::backend::vaapi::decoder::va_surface_id;
-use crate::backend::vaapi::decoder::PoolCreationMode;
 use crate::backend::vaapi::decoder::VaStreamInfo;
 use crate::backend::vaapi::decoder::VaapiBackend;
 use crate::backend::vaapi::decoder::VaapiPicture;
@@ -32,8 +29,11 @@ use crate::decoder::stateless::NewPictureResult;
 use crate::decoder::stateless::NewStatelessDecoderError;
 use crate::decoder::stateless::StatelessBackendResult;
 use crate::decoder::stateless::StatelessDecoder;
+use crate::decoder::stateless::StatelessDecoderBackend;
 use crate::decoder::stateless::StatelessDecoderBackendPicture;
 use crate::decoder::BlockingMode;
+use crate::decoder::DecodedHandle;
+use crate::video_frame::VideoFrame;
 use crate::Rect;
 use crate::Resolution;
 
@@ -228,22 +228,29 @@ fn build_slice_param(
     )))
 }
 
-impl<M: SurfaceMemoryDescriptor + 'static> StatelessDecoderBackendPicture<Vp9> for VaapiBackend<M> {
-    type Picture = VaapiPicture<M>;
+impl<V: VideoFrame> StatelessDecoderBackendPicture<Vp9> for VaapiBackend<V> {
+    type Picture = VaapiPicture<V>;
 }
 
-impl<M: SurfaceMemoryDescriptor + 'static> StatelessVp9DecoderBackend for VaapiBackend<M> {
+impl<V: VideoFrame> StatelessVp9DecoderBackend for VaapiBackend<V> {
     fn new_sequence(&mut self, header: &Header) -> StatelessBackendResult<()> {
-        self.new_sequence(header, PoolCreationMode::Highest)
+        self.new_sequence(header)
     }
 
-    fn new_picture(&mut self, timestamp: u64) -> NewPictureResult<Self::Picture> {
-        let highest_pool = self.highest_pool();
-        let surface = highest_pool.get_surface().ok_or(NewPictureError::OutOfOutputBuffers)?;
-        let metadata = self.metadata_state.get_parsed()?;
-        let context = &metadata.context;
+    fn new_picture(
+        &mut self,
+        timestamp: u64,
+        alloc_cb: &mut dyn FnMut() -> Option<
+            <<Self as StatelessDecoderBackend>::Handle as DecodedHandle>::Frame,
+        >,
+    ) -> NewPictureResult<Self::Picture> {
+        let context = &self.context;
 
-        Ok(VaPicture::new(timestamp, Rc::clone(context), surface))
+        Ok(VaapiPicture::new(
+            timestamp,
+            Rc::clone(context),
+            alloc_cb().ok_or(NewPictureError::OutOfOutputBuffers)?,
+        ))
     }
 
     fn submit_picture(
@@ -254,8 +261,7 @@ impl<M: SurfaceMemoryDescriptor + 'static> StatelessVp9DecoderBackend for VaapiB
         bitstream: &[u8],
         segmentation: &[Segmentation; MAX_SEGMENTS],
     ) -> StatelessBackendResult<Self::Handle> {
-        let metadata = self.metadata_state.get_parsed()?;
-        let context = &metadata.context;
+        let context = &self.context;
 
         let reference_frames: [u32; NUM_REF_FRAMES] =
             reference_frames.iter().map(va_surface_id).collect::<Vec<_>>().try_into().unwrap();
@@ -281,16 +287,12 @@ impl<M: SurfaceMemoryDescriptor + 'static> StatelessVp9DecoderBackend for VaapiB
     }
 }
 
-impl<M: SurfaceMemoryDescriptor + 'static> StatelessDecoder<Vp9, VaapiBackend<M>> {
+impl<V: VideoFrame> StatelessDecoder<Vp9, VaapiBackend<V>> {
     // Creates a new instance of the decoder using the VAAPI backend.
-    pub fn new_vaapi<S>(
+    pub fn new_vaapi(
         display: Rc<Display>,
         blocking_mode: BlockingMode,
-    ) -> Result<Self, NewStatelessDecoderError>
-    where
-        M: From<S>,
-        S: From<M>,
-    {
+    ) -> Result<Self, NewStatelessDecoderError> {
         Self::new(VaapiBackend::new(display, true), blocking_mode)
     }
 }

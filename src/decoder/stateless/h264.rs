@@ -44,14 +44,12 @@ use crate::codec::h264::picture::Reference;
 use crate::decoder::stateless::DecodeError;
 use crate::decoder::stateless::DecodingState;
 use crate::decoder::stateless::NewPictureResult;
-use crate::decoder::stateless::PoolLayer;
 use crate::decoder::stateless::StatelessBackendResult;
 use crate::decoder::stateless::StatelessCodec;
 use crate::decoder::stateless::StatelessDecoder;
 use crate::decoder::stateless::StatelessDecoderBackend;
 use crate::decoder::stateless::StatelessDecoderBackendPicture;
 use crate::decoder::stateless::StatelessVideoDecoder;
-use crate::decoder::stateless::TryFormat;
 use crate::decoder::BlockingMode;
 use crate::decoder::DecodedHandle;
 use crate::decoder::DecoderEvent;
@@ -86,7 +84,13 @@ pub trait StatelessH264DecoderBackend:
     fn new_sequence(&mut self, sps: &Rc<Sps>) -> StatelessBackendResult<()>;
 
     /// Called when the decoder determines that a frame or field was found.
-    fn new_picture(&mut self, timestamp: u64) -> NewPictureResult<Self::Picture>;
+    fn new_picture(
+        &mut self,
+        timestamp: u64,
+        alloc_cb: &mut dyn FnMut() -> Option<
+            <<Self as StatelessDecoderBackend>::Handle as DecodedHandle>::Frame,
+        >,
+    ) -> NewPictureResult<Self::Picture>;
 
     /// Called when the decoder determines that a second field was found.
     /// Indicates that the underlying BackendHandle is to be shared between the
@@ -832,7 +836,7 @@ where
 
 impl<B> StatelessDecoder<H264, B>
 where
-    B: StatelessH264DecoderBackend + TryFormat<H264>,
+    B: StatelessH264DecoderBackend,
     B::Handle: Clone,
 {
     fn negotiation_possible(sps: &Sps, old_negotiation_info: &NegotiationInfo) -> bool {
@@ -1030,6 +1034,9 @@ where
         &mut self,
         timestamp: u64,
         slice: &Slice,
+        alloc_cb: &mut dyn FnMut() -> Option<
+            <<B as StatelessDecoderBackend>::Handle as DecodedHandle>::Frame,
+        >,
     ) -> Result<CurrentPicState<B::Picture>, DecodeError> {
         let hdr = &slice.header;
         let pps = Rc::clone(
@@ -1051,7 +1058,7 @@ where
         let mut backend_pic = if let Some(first_field) = &first_field {
             self.backend.new_field_picture(timestamp, &first_field.1)
         } else {
-            self.backend.new_picture(timestamp)
+            self.backend.new_picture(timestamp, alloc_cb)
         }?;
 
         let nalu_hdr = &slice.nalu.header;
@@ -1169,7 +1176,14 @@ where
         Ok(handle)
     }
 
-    fn process_nalu(&mut self, timestamp: u64, nalu: Nalu) -> Result<(), DecodeError> {
+    fn process_nalu(
+        &mut self,
+        timestamp: u64,
+        nalu: Nalu,
+        alloc_cb: &mut dyn FnMut() -> Option<
+            <<B as StatelessDecoderBackend>::Handle as DecodedHandle>::Frame,
+        >,
+    ) -> Result<(), DecodeError> {
         match nalu.header.type_ {
             NaluType::Sps => {
                 self.codec
@@ -1196,7 +1210,7 @@ where
                     .map_err(|err| DecodeError::ParseFrameError(err))?;
                 let mut cur_pic = match self.codec.current_pic.take() {
                     // No current picture, start a new one.
-                    None => self.begin_picture(timestamp, &slice)?,
+                    None => self.begin_picture(timestamp, &slice, alloc_cb)?,
                     // We have a current picture but are starting a new field, or first_mb_in_slice
                     // indicates that a new picture is starting: finish the current picture and
                     // start a new one.
@@ -1208,7 +1222,7 @@ where
                             || (slice.header.first_mb_in_slice == 0) =>
                     {
                         self.finish_picture(cur_pic)?;
-                        self.begin_picture(timestamp, &slice)?
+                        self.begin_picture(timestamp, &slice, alloc_cb)?
                     }
                     // This slice is part of the current picture.
                     Some(cur_pic) => cur_pic,
@@ -1228,13 +1242,19 @@ where
 
 impl<B> StatelessVideoDecoder for StatelessDecoder<H264, B>
 where
-    B: StatelessH264DecoderBackend + TryFormat<H264>,
+    B: StatelessH264DecoderBackend,
     B::Handle: Clone + 'static,
 {
     type Handle = B::Handle;
-    type FramePool = B::FramePool;
 
-    fn decode(&mut self, timestamp: u64, bitstream: &[u8]) -> Result<usize, DecodeError> {
+    fn decode(
+        &mut self,
+        timestamp: u64,
+        bitstream: &[u8],
+        alloc_cb: &mut dyn FnMut() -> Option<
+            <<B as StatelessDecoderBackend>::Handle as DecodedHandle>::Frame,
+        >,
+    ) -> Result<usize, DecodeError> {
         let mut cursor = Cursor::new(bitstream);
         let nalu = Nalu::next(&mut cursor).map_err(|err| DecodeError::ParseFrameError(err))?;
 
@@ -1271,13 +1291,13 @@ where
             // from the stream.
             DecodingState::AwaitingStreamInfo | DecodingState::Reset => {
                 if matches!(nalu.header.type_, NaluType::Pps) {
-                    self.process_nalu(timestamp, nalu)?;
+                    self.process_nalu(timestamp, nalu, alloc_cb)?;
                 }
             }
             // Ask the client to confirm the format before we can process this.
             DecodingState::AwaitingFormat(_) => return Err(DecodeError::CheckEvents),
             DecodingState::Decoding => {
-                self.process_nalu(timestamp, nalu)?;
+                self.process_nalu(timestamp, nalu, alloc_cb)?;
             }
         }
 
@@ -1297,10 +1317,6 @@ where
             // on the next decode() call.
             decoder.apply_sps(sps);
         })
-    }
-
-    fn frame_pool(&mut self, layer: PoolLayer) -> Vec<&mut B::FramePool> {
-        self.backend.frame_pool(layer)
     }
 
     fn stream_info(&self) -> Option<&StreamInfo> {
