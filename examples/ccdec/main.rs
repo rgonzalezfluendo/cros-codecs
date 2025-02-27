@@ -37,7 +37,7 @@ use cros_codecs::utils::align_up;
 use cros_codecs::video_frame::frame_pool::FramePool;
 use cros_codecs::video_frame::frame_pool::PooledVideoFrame;
 use cros_codecs::video_frame::gbm_video_frame::GbmDevice;
-use cros_codecs::video_frame::gbm_video_frame::GbmVideoFrame;
+use cros_codecs::video_frame::generic_dma_video_frame::GenericDmaVideoFrame;
 use cros_codecs::video_frame::VideoFrame;
 use cros_codecs::video_frame::UV_PLANE;
 use cros_codecs::video_frame::Y_PLANE;
@@ -112,10 +112,12 @@ fn main() {
         <Arc<GbmDevice> as Clone>::clone(&gbm_device)
             .new_frame(
                 Fourcc::from(b"NV12"),
-                stream_info.display_resolution.clone(),
-                stream_info.coded_resolution.clone(),
+                stream_info.display_resolution,
+                stream_info.coded_resolution,
             )
             .expect("Could not allocate frame for frame pool!")
+            .to_generic_dma_video_frame()
+            .expect("Could not export GBM frame to DMA frame!")
     })));
     // This is a workaround to get "copy by clone" semantics for closure variable capture since
     // Rust lacks the appropriate syntax to express this concept.
@@ -125,8 +127,8 @@ fn main() {
     };
     let alloc_cb = move || (*framepool.lock().unwrap()).alloc();
 
-    let on_new_frame = move |job: C2DecodeJob<PooledVideoFrame<GbmVideoFrame>>| {
-        if !args.output.is_some() && !args.compute_md5.is_some() && !args.golden.is_some() {
+    let on_new_frame = move |job: C2DecodeJob<PooledVideoFrame<GenericDmaVideoFrame>>| {
+        if args.output.is_none() && args.compute_md5.is_none() && args.golden.is_none() {
             return;
         }
         let width = job.output[0].resolution().width as usize;
