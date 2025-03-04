@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use crate::decoder::stateless::NewStatelessDecoderError;
 use crate::decoder::stateless::StatelessDecoderBackend;
 use crate::decoder::DecodedHandle;
 use crate::decoder::StreamInfo;
@@ -102,9 +103,9 @@ pub struct V4l2StatelessDecoderBackend<V: VideoFrame> {
 }
 
 impl<V: VideoFrame> V4l2StatelessDecoderBackend<V> {
-    pub fn new() -> Self {
-        Self {
-            device: V4l2Device::new(),
+    pub fn new() -> Result<Self, NewStatelessDecoderError> {
+        Ok(Self {
+            device: V4l2Device::new()?,
             stream_info: StreamInfo {
                 format: DecodedFormat::I420,
                 min_num_frames: 0,
@@ -112,7 +113,7 @@ impl<V: VideoFrame> V4l2StatelessDecoderBackend<V> {
                 display_resolution: Resolution::from((0, 0)),
             },
             frame_counter: 0,
-        }
+        })
     }
 }
 
@@ -122,5 +123,9 @@ impl<V: VideoFrame> StatelessDecoderBackend for V4l2StatelessDecoderBackend<V> {
     fn stream_info(&self) -> Option<&StreamInfo> {
         // TODO
         Some(&self.stream_info)
+    }
+
+    fn reset_backend(&mut self) -> anyhow::Result<()> {
+        Ok(self.device.reset_queues()?)
     }
 }

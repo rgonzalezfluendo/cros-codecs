@@ -43,18 +43,16 @@ use v4l2r::Format;
 use v4l2r::PlaneLayout;
 
 use crate::decoder::stateless::DecodeError;
+use crate::decoder::stateless::NewStatelessDecoderError;
 use crate::decoder::stateless::StatelessBackendError;
 use crate::utils::buffer_size_for_area;
 use crate::video_frame::V4l2VideoFrame;
 use crate::video_frame::VideoFrame;
 use crate::Fourcc;
-use crate::Rect;
 use crate::Resolution;
 
 //TODO: handle memory backends other than mmap
 //TODO: handle video formats other than h264
-//TODO: handle queue start/stop at runtime
-//TODO: handle DRC at runtime
 //TODO: handle synced buffers in Streaming state
 #[derive(Default)]
 enum V4l2OutputQueueHandle<T: v4l2r::device::queue::direction::Direction> {
@@ -94,6 +92,16 @@ pub enum QueueError {
     BufferQueue,
     #[error("requested {0} buffers, only {1} allocated")]
     NotEnoughRequestedBuffers(usize, usize),
+    #[error("failed to stream off.")]
+    StreamOff,
+    #[error("failed to get queue handle.")]
+    QueueHandle,
+    #[error("failed to free buffers.")]
+    FreeBuffer,
+    #[error("failed to reset OUTPUT queue.")]
+    ResetOutputQueue,
+    #[error("failed to reset CAPTURE queue.")]
+    ResetCaptureQueue,
 }
 
 impl From<QueueError> for DecodeError {
@@ -218,11 +226,32 @@ pub struct V4l2OutputQueue {
 
 const NUM_OUTPUT_BUFFERS: u32 = 2;
 impl V4l2OutputQueue {
-    pub fn new(device: Arc<Device>) -> Self {
-        let handle = Queue::get_output_mplane_queue(device).expect("Failed to get output queue");
+    pub fn new(device: Arc<Device>) -> Result<Self, NewStatelessDecoderError> {
+        let handle = Queue::get_output_mplane_queue(device)
+            .map_err(|_| NewStatelessDecoderError::DriverInitialization)?;
         log::debug!("output queue created");
         let handle = Rc::new(RefCell::new(V4l2OutputQueueHandle::Init(handle)));
-        Self { handle }
+        Ok(Self { handle })
+    }
+
+    pub fn reset(&mut self, device: Arc<Device>) -> Result<(), QueueError> {
+        let handle = self.handle.take();
+        let (ret, handle) = match handle {
+            V4l2OutputQueueHandle::Streaming(handle) => {
+                handle.stream_off().map_err(|_| QueueError::StreamOff)?;
+                (Rc::into_inner(handle).ok_or(QueueError::QueueHandle)?)
+                    .free_buffers()
+                    .map_err(|_| QueueError::FreeBuffer)?;
+
+                let queue_handle = Queue::get_output_mplane_queue(device.clone())
+                    .map_err(|_| QueueError::QueueHandle);
+
+                (Ok(()), V4l2OutputQueueHandle::Init(queue_handle?))
+            }
+            _ => (Err(QueueError::State), handle),
+        };
+        self.handle.replace(handle);
+        ret
     }
 
     pub fn initialize(
@@ -259,9 +288,7 @@ impl V4l2OutputQueue {
 
                 V4l2OutputQueueHandle::Streaming(handle.into())
             }
-            _ => {
-                todo!("DRC is not supported")
-            }
+            _ => return Err(QueueError::State),
         });
         Ok(self)
     }
@@ -298,19 +325,11 @@ impl V4l2OutputQueue {
 pub struct V4l2CaptureBuffer<V: VideoFrame> {
     pub frame: Arc<V>,
     handle: DqBuffer<Capture, V4l2VideoFrame<V>>,
-    visible_rect: Rect,
 }
 
 impl<V: VideoFrame> V4l2CaptureBuffer<V> {
-    fn new(
-        frame: Arc<V>,
-        handle: DqBuffer<Capture, V4l2VideoFrame<V>>,
-        visible_rect: Rect,
-    ) -> Self {
-        Self { frame, handle, visible_rect }
-    }
-    pub fn index(&self) -> usize {
-        self.handle.data.index() as usize
+    fn new(frame: Arc<V>, handle: DqBuffer<Capture, V4l2VideoFrame<V>>) -> Self {
+        Self { frame, handle }
     }
     pub fn timestamp(&self) -> u64 {
         self.handle.data.timestamp().tv_usec as u64
@@ -319,15 +338,9 @@ impl<V: VideoFrame> V4l2CaptureBuffer<V> {
     //    pub fn has_error(&self) -> bool {
     //        self.handle.data.has_error() as u64
     //    }
-
-    //TODO make this work for formats other then 420
-    pub fn length(&self) -> usize {
-        (Resolution::from(self.visible_rect).get_area() * 3) / 2
-    }
 }
 
 pub struct V4l2CaptureQueue<V: VideoFrame> {
-    visible_rect: Rect,
     format: Format,
     handle: RefCell<V4l2CaptureQueueHandle<direction::Capture, V>>,
     num_buffers: u32,
@@ -335,25 +348,35 @@ pub struct V4l2CaptureQueue<V: VideoFrame> {
 }
 
 impl<V: VideoFrame> V4l2CaptureQueue<V> {
-    pub fn new(device: Arc<Device>) -> Self {
-        let handle =
-            Queue::get_capture_mplane_queue(device.clone()).expect("Failed to get capture queue");
+    pub fn new(device: Arc<Device>) -> Result<Self, NewStatelessDecoderError> {
+        let handle = Queue::get_capture_mplane_queue(device.clone())
+            .map_err(|_| NewStatelessDecoderError::DriverInitialization)?;
         log::debug!("capture queue created");
         let handle = RefCell::new(V4l2CaptureQueueHandle::Init(handle));
-        Self {
-            handle,
-            num_buffers: 0,
-            visible_rect: Default::default(),
-            format: Default::default(),
-            device: device,
-        }
+        Ok(Self { handle, num_buffers: 0, format: Default::default(), device: device })
     }
 
-    pub fn initialize(
-        &mut self,
-        visible_rect: Rect,
-        requested_num_buffers: u32,
-    ) -> Result<&mut Self, QueueError> {
+    pub fn reset(&mut self, device: Arc<Device>) -> Result<(), QueueError> {
+        let handle = self.handle.take();
+        let (ret, handle) = match handle {
+            V4l2CaptureQueueHandle::Streaming(handle) => {
+                handle.stream_off().map_err(|_| QueueError::StreamOff)?;
+                (Rc::into_inner(handle).ok_or(QueueError::QueueHandle)?)
+                    .free_buffers()
+                    .map_err(|_| QueueError::FreeBuffer)?;
+
+                let queue_handle = Queue::get_capture_mplane_queue(device.clone())
+                    .map_err(|_| QueueError::QueueHandle);
+
+                (Ok(()), V4l2CaptureQueueHandle::Init(queue_handle?))
+            }
+            _ => (Err(QueueError::State), handle),
+        };
+        self.handle.replace(handle);
+        ret
+    }
+
+    pub fn initialize(&mut self, requested_num_buffers: u32) -> Result<&mut Self, QueueError> {
         // +2 due to HCMP1_HHI_A.h264 needing more
         let requested_num_buffers = requested_num_buffers + 2;
 
@@ -369,14 +392,13 @@ impl<V: VideoFrame> V4l2CaptureQueue<V> {
 
                 check_requested_buffer_count(requested_num_buffers, handle.num_free_buffers())?;
 
-                self.visible_rect = visible_rect;
                 self.num_buffers = requested_num_buffers;
 
                 handle.stream_on()?;
 
                 V4l2CaptureQueueHandle::Streaming(handle.into())
             }
-            _ => todo!("DRC is not supported"),
+            _ => return Err(QueueError::State),
         });
 
         Ok(self)
@@ -392,7 +414,7 @@ impl<V: VideoFrame> V4l2CaptureQueue<V> {
                     // buffer.data.has_error();
                     let mut frame = buffer.take_handles().expect("Missing handle on dequeue!").0;
                     frame.process_dqbuf(self.device.clone(), &self.format, &buffer.data);
-                    Ok(Some(V4l2CaptureBuffer::new(Arc::new(frame), buffer, self.visible_rect)))
+                    Ok(Some(V4l2CaptureBuffer::new(Arc::new(frame), buffer)))
                 }
                 _ => Ok(None),
             },
@@ -414,13 +436,7 @@ impl<V: VideoFrame> V4l2CaptureQueue<V> {
         }
         Ok(())
     }
-    pub fn num_buffers(&self) -> usize {
-        let handle = &*self.handle.borrow();
-        match handle {
-            V4l2CaptureQueueHandle::Streaming(handle) => handle.num_buffers(),
-            _ => 0,
-        }
-    }
+
     pub fn num_free_buffers(&self) -> usize {
         let handle = &*self.handle.borrow();
         match handle {

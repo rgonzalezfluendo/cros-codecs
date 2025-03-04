@@ -2,6 +2,10 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#[cfg(target_arch = "x86_64")]
+use core::arch::x86_64::_mm_clflush;
+#[cfg(target_arch = "x86_64")]
+use core::arch::x86_64::_mm_mfence;
 use std::cell::RefCell;
 use std::fs::File;
 use std::iter::zip;
@@ -11,6 +15,7 @@ use std::ptr::NonNull;
 #[cfg(feature = "vaapi")]
 use std::rc::Rc;
 use std::slice;
+use std::sync::atomic::{fence, Ordering};
 #[cfg(feature = "v4l2")]
 use std::sync::Arc;
 
@@ -159,6 +164,7 @@ impl<'a> DmaMapping<'a> {
             dma_buf_sync { flags: DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE };
 
         for fd in borrowed_dma_handles.iter() {
+            // SAFETY: This assumes fd is a valid DMA buffer.
             handle_eintr(&mut || unsafe { dma_buf_ioctl_sync(fd.as_raw_fd(), &sync_struct) })?;
         }
 
@@ -167,6 +173,8 @@ impl<'a> DmaMapping<'a> {
         let mut addrs: Vec<NonNull<libc::c_void>> = vec![];
         if borrowed_dma_handles.len() > 1 {
             for i in 0..offsets.len() {
+                // SAFETY: This assumes that fd is a valid DMA buffer and that our lens and offsets
+                // are correct.
                 addrs.push(unsafe {
                     mmap(
                         None,
@@ -188,6 +196,8 @@ impl<'a> DmaMapping<'a> {
         } else {
             let total_size = NonZeroUsize::new(lens.iter().sum::<usize>() + offsets[0])
                 .ok_or("Attempted to map VideoFrame of length 0")?;
+            // SAFETY: This assumes that fd is a valid DMA buffer and that our lens and offsets are
+            // correct.
             unsafe {
                 let base_addr = mmap(
                     None,
@@ -210,6 +220,10 @@ impl<'a> DmaMapping<'a> {
 
         let mut detiled_bufs = vec![];
         if modifier == DrmModifier::I915_y_tiled {
+            // SAFETY: This assumes mmap returned a valid memory address. Note that nix's mmap
+            // bindings already check for null pointers, which we turn into Rust Err objects. So
+            // this assumption will only be violated if mmap itself has a bug that returns a
+            // non-NULL, but invalid pointer.
             let tiled_bufs: Vec<&[u8]> = unsafe {
                 zip(addrs.iter(), lens.iter())
                     .map(|x| slice::from_raw_parts(x.0.as_ptr() as *const u8, *x.1))
@@ -243,6 +257,10 @@ impl<'a> ReadMapping<'a> for DmaMapping<'a> {
         if self.detiled_bufs.len() > 0 {
             self.detiled_bufs.iter().map(|x| x.as_slice()).collect()
         } else {
+            // SAFETY: This assumes mmap returned a valid memory address. Note that nix's mmap
+            // bindings already check for null pointers, which we turn into Rust Err objects. So
+            // this assumption will only be violated if mmap itself has a bug that returns a
+            // non-NULL, but invalid pointer.
             unsafe {
                 zip(self.addrs.iter(), self.lens.iter())
                     .map(|x| slice::from_raw_parts(x.0.as_ptr() as *const u8, *x.1))
@@ -260,6 +278,10 @@ impl<'a> WriteMapping<'a> for DmaMapping<'a> {
 
         // The above check prevents us from undefined behavior in the event that the user attempts
         // to coerce a ReadMapping into a WriteMapping.
+        // SAFETY: This assumes mmap returned a valid memory address. Note that nix's mmap bindings
+        // already check for null pointers, which we turn into Rust Err objects. So this assumptoin
+        // will only be violated if mmap itself has a bug that returns a non-NULL, but invalid
+        // pointer.
         unsafe {
             zip(self.addrs.iter(), self.lens.iter())
                 .map(|x| RefCell::new(slice::from_raw_parts_mut(x.0.as_ptr() as *mut u8, *x.1)))
@@ -270,8 +292,10 @@ impl<'a> WriteMapping<'a> for DmaMapping<'a> {
 
 impl<'a> Drop for DmaMapping<'a> {
     fn drop(&mut self) {
+        // SAFETY: This should be safe because we would not instantiate a DmaMapping object if the
+        // first call to dma_buf_ioctl_sync or the mmap call failed.
         unsafe {
-            let _ = zip(self.addrs.iter(), self.lens.iter()).map(|x| munmap(*x.0, *x.1).unwrap());
+            fence(Ordering::SeqCst);
 
             // Flush all cache lines back to main memory.
             let sync_struct =
@@ -279,6 +303,30 @@ impl<'a> Drop for DmaMapping<'a> {
             for fd in self.dma_handles.iter() {
                 let _ = handle_eintr(&mut || dma_buf_ioctl_sync(fd.as_raw_fd(), &sync_struct));
             }
+
+            // For some reason, DMA_BUF_IOCTL_SYNC is insufficient on Intel machines, and we have
+            // to manually flush the cache lines. This is probably a violation of the DMA API spec?
+            #[cfg(target_arch = "x86_64")]
+            {
+                // Note that fence() only guarantees that the compiler won't reorder memory
+                // operations, and we need to call _mm_mfence() to guarantee the CPU won't do it.
+                _mm_mfence();
+
+                for (addr, len) in zip(self.addrs.iter(), self.lens.iter()) {
+                    // TODO: We shouldn't actually have to flush every address, we should just
+                    // flush the address at the beginning of each cache line. But, during testing
+                    // this caused a race condition.
+                    for offset in 0..*len {
+                        _mm_clflush((addr.as_ptr() as *const u8).offset(offset as isize));
+                    }
+                }
+
+                _mm_mfence();
+            }
+
+            fence(Ordering::SeqCst);
+
+            let _ = zip(self.addrs.iter(), self.lens.iter()).map(|x| munmap(*x.0, *x.1).unwrap());
         }
     }
 }
@@ -292,6 +340,8 @@ pub struct GenericDmaVideoFrame {
 impl Clone for GenericDmaVideoFrame {
     fn clone(&self) -> Self {
         Self {
+            // SAFETY: This is safe because we are dup'ing the fd, giving the clone'd
+            // GenericDmaVideoFrame ownership of the new fd.
             dma_handles: self
                 .dma_handles
                 .iter()
@@ -449,10 +499,11 @@ impl VideoFrame for GenericDmaVideoFrame {
     fn fill_v4l2_plane(&self, index: usize, plane: &mut v4l2_plane) {
         if self.dma_handles.len() == 1 {
             plane.m.fd = self.dma_handles[0].as_raw_fd();
+            plane.length = self.dma_handles[0].metadata().unwrap().len() as u32;
         } else {
             plane.m.fd = self.dma_handles[index].as_raw_fd();
+            plane.length = self.get_single_plane_size(index) as u32;
         }
-        plane.length = self.get_single_plane_size(index) as u32;
         // WARNING: Importing DMA buffers with an offset is not officially supported by V4L2, but
         // several drivers (including MTK venc) will respect the data_offset field.
         plane.data_offset = self.layout.planes[index].offset as u32;

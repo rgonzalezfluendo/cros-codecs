@@ -5,7 +5,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, RawFd};
-use std::path::Path;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::thread::sleep;
@@ -19,14 +18,15 @@ use v4l2r::nix::fcntl::OFlag;
 use v4l2r::nix::sys::stat::Mode;
 
 use crate::decoder::stateless::DecodeError;
+use crate::decoder::stateless::NewStatelessDecoderError;
 use crate::device::v4l2::stateless::queue::QueueError;
 use crate::device::v4l2::stateless::queue::V4l2CaptureBuffer;
 use crate::device::v4l2::stateless::queue::V4l2CaptureQueue;
 use crate::device::v4l2::stateless::queue::V4l2OutputQueue;
 use crate::device::v4l2::stateless::request::V4l2Request;
+use crate::device::v4l2::utils::enumerate_devices;
 use crate::video_frame::VideoFrame;
 use crate::Fourcc;
-use crate::Rect;
 use crate::Resolution;
 
 //TODO: handle other memory backends for OUTPUT queue
@@ -42,28 +42,42 @@ struct DeviceHandle<V: VideoFrame> {
 }
 
 impl<V: VideoFrame> DeviceHandle<V> {
-    fn new() -> Self {
-        // TODO: pass video device path and config via function arguments
-        let video_device_path = Path::new("/dev/video-dec0");
+    fn new() -> Result<Self, NewStatelessDecoderError> {
+        let devices = enumerate_devices();
+        let (video_device_path, media_device_path) = match devices {
+            Some(paths) => paths,
+            None => return Err(NewStatelessDecoderError::DriverInitialization),
+        };
+
         let video_device_config = DeviceConfig::new().non_blocking_dqbuf();
         let video_device = Arc::new(
-            VideoDevice::open(video_device_path, video_device_config)
-                .expect("Failed to open video device"),
+            VideoDevice::open(&video_device_path, video_device_config)
+                .map_err(|_| NewStatelessDecoderError::DriverInitialization)?,
         );
-        // TODO: probe capabilties to find releted media device path
-        let media_device_path = Path::new("/dev/media-dec0");
-        let media_device = open(media_device_path, OFlag::O_RDWR | OFlag::O_CLOEXEC, Mode::empty())
-            .unwrap_or_else(|_| panic!("Cannot open {}", media_device_path.display()));
-        let output_queue = V4l2OutputQueue::new(video_device.clone());
-        let capture_queue = V4l2CaptureQueue::new(video_device.clone());
-        Self {
+
+        let media_device =
+            open(&media_device_path, OFlag::O_RDWR | OFlag::O_CLOEXEC, Mode::empty())
+                .map_err(|_| NewStatelessDecoderError::DriverInitialization)?;
+        let output_queue = V4l2OutputQueue::new(video_device.clone())?;
+        let capture_queue = V4l2CaptureQueue::new(video_device.clone())?;
+        Ok(Self {
             video_device,
             media_device,
             output_queue,
             capture_queue,
             requests: HashMap::<u64, Weak<RefCell<V4l2Request<V>>>>::new(),
-        }
+        })
     }
+
+    pub fn reset_queues(&mut self) -> Result<(), QueueError> {
+        self.output_queue
+            .reset(self.video_device.clone())
+            .map_err(|_| QueueError::ResetOutputQueue)?;
+        self.capture_queue
+            .reset(self.video_device.clone())
+            .map_err(|_| QueueError::ResetCaptureQueue)
+    }
+
     fn alloc_request(&self) -> ioctl::Request {
         ioctl::Request::alloc(&self.media_device).expect("Failed to alloc request handle")
     }
@@ -140,24 +154,22 @@ pub struct V4l2Device<V: VideoFrame> {
 }
 
 impl<V: VideoFrame> V4l2Device<V> {
-    pub fn new() -> Self {
-        Self { handle: Rc::new(RefCell::new(DeviceHandle::new())) }
+    pub fn new() -> Result<Self, NewStatelessDecoderError> {
+        Ok(Self { handle: Rc::new(RefCell::new(DeviceHandle::new()?)) })
     }
-    pub fn num_free_buffers(&self) -> usize {
-        self.handle.borrow().output_queue.num_free_buffers()
+
+    pub fn reset_queues(&mut self) -> Result<(), QueueError> {
+        self.handle.borrow_mut().reset_queues()
     }
-    pub fn num_buffers(&self) -> usize {
-        self.handle.borrow().capture_queue.num_buffers()
-    }
+
     pub fn initialize_queues(
         &mut self,
         format: Fourcc,
         coded_size: Resolution,
-        visible_rect: Rect,
         num_buffers: u32,
     ) -> Result<(), anyhow::Error> {
         self.handle.borrow_mut().output_queue.initialize(format, coded_size)?;
-        self.handle.borrow_mut().capture_queue.initialize(visible_rect, num_buffers)?;
+        self.handle.borrow_mut().capture_queue.initialize(num_buffers)?;
         Ok(())
     }
     pub fn alloc_request(
@@ -182,7 +194,6 @@ impl<V: VideoFrame> V4l2Device<V> {
             }
             Err(error) => return Err(error),
         };
-        self.handle.borrow().capture_queue.queue_buffer(frame)?;
         self.handle.borrow_mut().try_dequeue_capture_buffers();
 
         let request = Rc::new(RefCell::new(V4l2Request::new(
@@ -190,12 +201,16 @@ impl<V: VideoFrame> V4l2Device<V> {
             timestamp,
             self.handle.borrow().alloc_request(),
             output_buffer,
+            frame,
         )));
         self.handle.borrow_mut().insert_request_into_hash(Rc::downgrade(&request.clone()));
         Ok(request)
     }
     pub fn sync(&self, timestamp: u64) -> V4l2CaptureBuffer<V> {
         self.handle.borrow_mut().sync(timestamp)
+    }
+    pub fn queue_capture_buffer(&self, frame: V) -> Result<(), QueueError> {
+        self.handle.borrow().capture_queue.queue_buffer(frame)
     }
 }
 

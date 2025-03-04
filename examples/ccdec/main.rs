@@ -15,6 +15,8 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use cros_codecs::bitstream_utils::IvfIterator;
 use cros_codecs::bitstream_utils::NalIterator;
 use cros_codecs::c2_wrapper::c2_decoder::C2DecoderWorker;
@@ -29,6 +31,7 @@ use cros_codecs::c2_wrapper::c2_vaapi_decoder::C2VaapiDecoderOptions;
 use cros_codecs::c2_wrapper::C2DecodeJob;
 use cros_codecs::c2_wrapper::C2Status;
 use cros_codecs::c2_wrapper::C2Wrapper;
+use cros_codecs::c2_wrapper::DrainMode;
 use cros_codecs::codec::h264::parser::Nalu as H264Nalu;
 use cros_codecs::codec::h265::parser::Nalu as H265Nalu;
 use cros_codecs::decoder::StreamInfo;
@@ -37,6 +40,7 @@ use cros_codecs::utils::align_up;
 use cros_codecs::video_frame::frame_pool::FramePool;
 use cros_codecs::video_frame::frame_pool::PooledVideoFrame;
 use cros_codecs::video_frame::gbm_video_frame::GbmDevice;
+use cros_codecs::video_frame::gbm_video_frame::GbmUsage;
 use cros_codecs::video_frame::generic_dma_video_frame::GenericDmaVideoFrame;
 use cros_codecs::video_frame::VideoFrame;
 use cros_codecs::video_frame::UV_PLANE;
@@ -114,6 +118,7 @@ fn main() {
                 Fourcc::from(b"NV12"),
                 stream_info.display_resolution,
                 stream_info.coded_resolution,
+                GbmUsage::Decode,
             )
             .expect("Could not allocate frame for frame pool!")
             .to_generic_dma_video_frame()
@@ -127,20 +132,24 @@ fn main() {
     };
     let alloc_cb = move || (*framepool.lock().unwrap()).alloc();
 
+    let frames_needed = Arc::new(AtomicU64::new((*golden_iter.lock().unwrap()).len() as u64));
+
+    let _frames_needed = frames_needed.clone();
     let on_new_frame = move |job: C2DecodeJob<PooledVideoFrame<GenericDmaVideoFrame>>| {
         if args.output.is_none() && args.compute_md5.is_none() && args.golden.is_none() {
             return;
         }
-        let width = job.output[0].resolution().width as usize;
-        let height = job.output[0].resolution().height as usize;
-        let luma_size = job.output[0].resolution().get_area();
+        let width = job.output.as_ref().unwrap().resolution().width as usize;
+        let height = job.output.as_ref().unwrap().resolution().height as usize;
+        let luma_size = job.output.as_ref().unwrap().resolution().get_area();
         let chroma_size = align_up(width, 2) / 2 * align_up(height, 2) / 2;
         let mut frame_data: Vec<u8> = vec![0; luma_size + 2 * chroma_size];
         let (dst_y, dst_uv) = frame_data.split_at_mut(luma_size);
         let (dst_u, dst_v) = dst_uv.split_at_mut(chroma_size);
         {
-            let src_pitches = job.output[0].get_plane_pitch();
-            let src_mapping = job.output[0].map().expect("Failed to map output frame!");
+            let src_pitches = job.output.as_ref().unwrap().get_plane_pitch();
+            let src_mapping =
+                job.output.as_ref().unwrap().map().expect("Failed to map output frame!");
             let src_planes = src_mapping.get();
             nv12_to_i420(
                 src_planes[Y_PLANE],
@@ -182,6 +191,7 @@ fn main() {
 
         if args.golden.is_some() {
             assert_eq!(frame_md5, (*golden_iter.lock().unwrap()).next().unwrap());
+            (*_frames_needed).fetch_sub(1, Ordering::SeqCst);
         }
     };
 
@@ -216,16 +226,17 @@ fn main() {
     for input_frame in frame_iter {
         decoder.queue(vec![C2DecodeJob {
             input: input_frame.as_ref().to_vec(),
-            output: vec![],
-            drain: false,
+            ..Default::default()
         }]);
     }
-    decoder.drain();
+    decoder.drain(DrainMode::EOSDrain);
 
     while decoder.is_alive() {
         thread::sleep(Duration::from_millis(10));
     }
     decoder.stop();
+
+    assert!((*frames_needed).load(Ordering::SeqCst) == 0, "Not all frames were output.");
 
     if stream_mode {
         println!("{}", (*_md5_context.lock().unwrap()).flush());
