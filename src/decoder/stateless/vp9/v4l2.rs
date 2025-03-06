@@ -24,6 +24,7 @@ use crate::decoder::stateless::vp9::Vp9;
 use crate::decoder::stateless::NewPictureError;
 use crate::decoder::stateless::NewPictureResult;
 use crate::decoder::stateless::NewStatelessDecoderError;
+use crate::decoder::stateless::StatelessBackendError;
 use crate::decoder::stateless::StatelessBackendResult;
 use crate::decoder::stateless::StatelessDecoder;
 use crate::decoder::stateless::StatelessDecoderBackend;
@@ -33,7 +34,6 @@ use crate::decoder::DecodedHandle;
 use crate::device::v4l2::stateless::controls::vp9::V4l2CtrlVp9FrameParams;
 use crate::device::v4l2::stateless::controls::vp9::Vp9V4l2Control;
 use crate::video_frame::VideoFrame;
-use crate::DecodedFormat;
 use crate::Fourcc;
 use crate::Rect;
 use crate::Resolution;
@@ -58,18 +58,7 @@ impl<V: VideoFrame> StatelessDecoderBackendPicture<Vp9> for V4l2StatelessDecoder
 
 impl<V: VideoFrame> StatelessVp9DecoderBackend for V4l2StatelessDecoderBackend<V> {
     fn new_sequence(&mut self, header: &Header) -> StatelessBackendResult<()> {
-        // TODO: Query the driver for the format
-        self.stream_info.format = DecodedFormat::MM21;
-        self.stream_info.display_resolution = Resolution::from(header.visible_rect());
-        self.stream_info.coded_resolution = header.coded_size().clone();
-        self.stream_info.min_num_frames = header.min_num_frames();
-
-        self.device.initialize_queues(
-            Fourcc::from(b"VP9F"),
-            header.coded_size(),
-            header.min_num_frames() as u32,
-        )?;
-        Ok(())
+        self.new_sequence(header, Fourcc::from(b"VP9F"))
     }
 
     fn new_picture(
@@ -137,12 +126,12 @@ impl<V: VideoFrame> StatelessVp9DecoderBackend for V4l2StatelessDecoderBackend<V
 
         // We have to do this manually since v4l2r does not directly support VP9
         let which = request.which();
-        ioctl::s_ext_ctrls(&self.device, which, &mut ctrl).expect("Failed to set output control");
+        ioctl::s_ext_ctrls(&self.device, which, &mut ctrl)
+            .map_err(|e| StatelessBackendError::Other(anyhow::anyhow!(e)))?;
 
         let mut reference_pictures = Vec::<Rc<RefCell<V4l2Picture<V>>>>::new();
         for frame in reference_frames {
             if frame.is_some() {
-                // TODO: I don't think this is right?
                 reference_pictures.push(frame.as_ref().unwrap().picture.clone());
             }
         }
