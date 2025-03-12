@@ -109,17 +109,15 @@ rust_test {
     },
 }
 
-rust_test {
+rust_binary {
     name: "ccdec",
     srcs: ["examples/ccdec/main.rs"],
-    test_suites: ["general-tests"],
     rustlibs: [
         "libenv_logger",
         "libcros_codecs",
         "libargh",
         "libserde_json",
     ],
-    // TODO(b/394365384): Group shared dependencies with rust_defaults
     enabled: false,
     arch: {
         x86_64: {
@@ -137,7 +135,9 @@ rust_test {
             ],
         },
     },
-    test_harness: false,
+    // This has the binary deployed to the same place as its dependencies by adb sync,
+    // which is /system/vendor/bin/ on the device.
+    vendor: true,
 }
 
 filegroup {
