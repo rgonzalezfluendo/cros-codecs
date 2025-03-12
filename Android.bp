@@ -140,6 +140,36 @@ rust_test {
     test_harness: false,
 }
 
+rust_binary {
+    name: "ccenc",
+    srcs: ["examples/ccenc/main.rs"],
+    rustlibs: [
+        "libenv_logger",
+        "libcros_codecs",
+        "libargh",
+    ],
+    enabled: false,
+    arch: {
+        x86_64: {
+            enabled: true,
+            features: [
+                "vaapi",
+                "backend",
+            ],
+        },
+        arm64: {
+            enabled: true,
+            features: [
+                "v4l2",
+                "backend",
+            ],
+        },
+    },
+    // This has the binary deployed to the same place as its dependencies by adb sync,
+    // which is /system/vendor/bin/ on the device.
+    vendor: true,
+}
+
 filegroup {
     name: "test_data",
     srcs: [
