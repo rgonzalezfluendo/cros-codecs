@@ -138,6 +138,7 @@ rust_binary {
     // This has the binary deployed to the same place as its dependencies by adb sync,
     // which is /system/vendor/bin/ on the device.
     vendor: true,
+    prefer_rlib: true,
 }
 
 rust_binary {
