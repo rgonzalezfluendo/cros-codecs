@@ -219,6 +219,9 @@ where
                 0,
                 0,
                 0,
+                // seg_id_block_size: VA_SEGID_BLOCK_16X16. No segmentation
+                // map buffer is submitted by this encoder, so this is unused.
+                0,
             ),
         ));
 
