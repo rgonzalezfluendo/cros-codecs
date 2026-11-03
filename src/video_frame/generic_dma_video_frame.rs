@@ -410,6 +410,104 @@ impl<T: Clone + Send + Sync + Sized + Debug + 'static> GenericDmaVideoFrame<T> {
     }
 }
 
+/// Descriptor requesting the linear DRM format modifier for a VA-API surface.
+#[cfg(feature = "vaapi")]
+struct LinearVaSurfaceDescriptor;
+
+#[cfg(feature = "vaapi")]
+#[repr(C)]
+struct VaDrmFormatModifierList {
+    num_modifiers: u32,
+    modifiers: *mut u64,
+}
+
+#[cfg(feature = "vaapi")]
+struct LinearModifierList {
+    list: VaDrmFormatModifierList,
+    modifiers: [u64; 1],
+}
+
+#[cfg(feature = "vaapi")]
+impl libva::SurfaceMemoryDescriptor for LinearVaSurfaceDescriptor {
+    fn add_attrs(
+        &mut self,
+        attrs: &mut Vec<libva::VASurfaceAttrib>,
+    ) -> Option<Box<dyn std::any::Any>> {
+        // DRM_FORMAT_MOD_LINEAR.
+        let mut modifiers = Box::new(LinearModifierList {
+            list: VaDrmFormatModifierList { num_modifiers: 1, modifiers: std::ptr::null_mut() },
+            modifiers: [0],
+        });
+        modifiers.list.modifiers = modifiers.modifiers.as_mut_ptr();
+
+        attrs.push(libva::VASurfaceAttrib {
+            type_: libva::VASurfaceAttribType::VASurfaceAttribDRMFormatModifiers,
+            flags: libva::VA_SURFACE_ATTRIB_SETTABLE,
+            value: libva::VAGenericValue::from(
+                &mut modifiers.list as *mut _ as *mut std::os::raw::c_void,
+            ),
+        });
+
+        // Keep the modifier list alive until `vaCreateSurfaces` returns.
+        Some(modifiers)
+    }
+}
+
+/// Allocates an NV12 frame backed by a linear VA-API surface.
+///
+/// Some drivers, notably AMD's radeonsi, cannot allocate NV12 buffers through
+/// GBM. Allocating a linear VA-API surface and exporting it as a DMA-BUF gives
+/// us a frame that can be mapped on the CPU and imported back into VA-API.
+#[cfg(feature = "vaapi")]
+pub fn new_vaapi_dma_frame(
+    display: &Rc<Display>,
+    fourcc: Fourcc,
+    resolution: Resolution,
+) -> Result<GenericDmaVideoFrame<()>, String> {
+    if fourcc != Fourcc::from(b"NV12") {
+        return Err(format!("Unsupported VA-API frame format: {fourcc}"));
+    }
+
+    let surfaces = display
+        .create_surfaces::<LinearVaSurfaceDescriptor>(
+            libva::VA_RT_FORMAT_YUV420,
+            Some(libva::VA_FOURCC_NV12),
+            resolution.width,
+            resolution.height,
+            Some(UsageHint::USAGE_HINT_EXPORT),
+            vec![LinearVaSurfaceDescriptor],
+        )
+        .map_err(|err| format!("Could not create linear VA-API surface: {err:?}"))?;
+    let surface = surfaces.into_iter().next().ok_or("No VA-API surface was created")?;
+    let descriptor = surface
+        .export_prime()
+        .map_err(|err| format!("Could not export VA-API surface: {err:?}"))?;
+
+    let modifier = descriptor
+        .objects
+        .first()
+        .ok_or("Exported VA-API surface has no objects")?
+        .drm_format_modifier;
+    let mut planes = vec![];
+    for layer in &descriptor.layers {
+        for plane in 0..layer.num_planes as usize {
+            planes.push(crate::PlaneLayout {
+                buffer_index: layer.object_index[plane] as usize,
+                offset: layer.offset[plane] as usize,
+                stride: layer.pitch[plane] as usize,
+            });
+        }
+    }
+    let layout = FrameLayout {
+        format: (Fourcc::from(descriptor.fourcc), modifier),
+        size: Resolution::from((descriptor.width, descriptor.height)),
+        planes,
+    };
+    let dma_handles = descriptor.objects.into_iter().map(|obj| File::from(obj.fd)).collect();
+
+    GenericDmaVideoFrame::new((), dma_handles, layout)
+}
+
 #[cfg(feature = "vaapi")]
 impl<T: Clone + Send + Sync + Sized + Debug + 'static> ExternalBufferDescriptor
     for GenericDmaVideoFrame<T>

@@ -41,6 +41,8 @@ use cros_codecs::video_frame::frame_pool::FramePool;
 use cros_codecs::video_frame::frame_pool::PooledVideoFrame;
 use cros_codecs::video_frame::gbm_video_frame::GbmDevice;
 use cros_codecs::video_frame::gbm_video_frame::GbmUsage;
+#[cfg(feature = "vaapi")]
+use cros_codecs::video_frame::generic_dma_video_frame::new_vaapi_dma_frame;
 use cros_codecs::video_frame::generic_dma_video_frame::GenericDmaVideoFrame;
 use cros_codecs::video_frame::VideoFrame;
 use cros_codecs::video_frame::UV_PLANE;
@@ -62,6 +64,24 @@ mod util;
 // Returns the frame iterator for IVF file.
 fn create_vpx_frame_iterator(input: &[u8]) -> Box<dyn Iterator<Item = Cow<[u8]>> + '_> {
     Box::new(IvfIterator::new(input).map(Cow::Borrowed))
+}
+
+// Allocates a frame through VA-API for drivers that cannot allocate NV12
+// buffers through GBM, such as AMD's radeonsi.
+#[cfg(feature = "vaapi")]
+fn allocate_vaapi_frame(
+    libva_device: &Option<PathBuf>,
+    stream_info: &StreamInfo,
+) -> GenericDmaVideoFrame<()> {
+    let display = match libva_device {
+        Some(path) => libva::Display::open_drm_display(path.clone())
+            .map_err(|err| format!("Could not open libva display: {err}")),
+        None => libva::Display::open().ok_or_else(|| "No DRM device found".to_string()),
+    }
+    .expect("Could not open libva display for frame allocation!");
+
+    new_vaapi_dma_frame(&display, Fourcc::from(b"NV12"), stream_info.coded_resolution.clone())
+        .expect("Could not allocate VA-API frame for frame pool!")
 }
 
 fn main() {
@@ -109,20 +129,32 @@ fn main() {
     };
     let stream_mode = Some(Md5Computation::Stream) == args.compute_md5;
 
-    let gbm_device = Arc::new(
-        GbmDevice::open(PathBuf::from("/dev/dri/renderD128")).expect("Could not open GBM device!"),
-    );
+    let gbm_device = GbmDevice::open(PathBuf::from("/dev/dri/renderD128")).ok().map(Arc::new);
+    #[cfg(feature = "vaapi")]
+    let libva_device = args.libva_device.clone();
     let framepool = Arc::new(Mutex::new(FramePool::new(move |stream_info: &StreamInfo| {
-        <Arc<GbmDevice> as Clone>::clone(&gbm_device)
-            .new_frame(
-                Fourcc::from(b"NV12"),
-                stream_info.display_resolution,
-                stream_info.coded_resolution,
-                GbmUsage::Decode,
-            )
-            .expect("Could not allocate frame for frame pool!")
-            .to_generic_dma_video_frame()
-            .expect("Could not export GBM frame to DMA frame!")
+        if let Some(gbm_device) = &gbm_device {
+            match <Arc<GbmDevice> as Clone>::clone(gbm_device)
+                .new_frame(
+                    Fourcc::from(b"NV12"),
+                    stream_info.display_resolution,
+                    stream_info.coded_resolution,
+                    GbmUsage::Decode,
+                )
+                .and_then(|frame| frame.to_generic_dma_video_frame())
+            {
+                Ok(frame) => return frame,
+                Err(err) => {
+                    log::warn!("Could not allocate a GBM frame, falling back to VA-API: {err}")
+                }
+            }
+        }
+
+        #[cfg(feature = "vaapi")]
+        return allocate_vaapi_frame(&libva_device, stream_info);
+
+        #[cfg(not(feature = "vaapi"))]
+        panic!("Could not allocate frame for frame pool!");
     })));
     // This is a workaround to get "copy by clone" semantics for closure variable capture since
     // Rust lacks the appropriate syntax to express this concept.
