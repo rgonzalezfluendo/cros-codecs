@@ -224,7 +224,7 @@ impl<V: VideoFrame> StatelessVp8DecoderBackend for VaapiBackend<V> {
     ) -> NewPictureResult<Self::Picture> {
         Ok(VaapiPicture::new(
             timestamp,
-            Rc::clone(&self.context),
+            Rc::clone(self.require_context()),
             alloc_cb().ok_or(NewPictureError::OutOfOutputBuffers)?,
         ))
     }
@@ -246,7 +246,7 @@ impl<V: VideoFrame> StatelessVp8DecoderBackend for VaapiBackend<V> {
 
         let coded_resolution =
             &self.stream_info().ok_or(anyhow!("No stream info found!"))?.coded_resolution;
-        let context = &self.context;
+        let context = self.require_context();
 
         let iq_buffer = context
             .create_buffer(build_iq_matrix(hdr, segmentation)?)

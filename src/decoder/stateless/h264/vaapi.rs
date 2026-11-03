@@ -464,7 +464,7 @@ impl<V: VideoFrame> StatelessH264DecoderBackend for VaapiBackend<V> {
         dpb: &Dpb<Self::Handle>,
         hdr: &SliceHeader,
     ) -> StatelessBackendResult<()> {
-        let context = &self.context;
+        let context = self.require_context();
 
         let surface_id = picture.surface().id();
 
@@ -491,7 +491,7 @@ impl<V: VideoFrame> StatelessH264DecoderBackend for VaapiBackend<V> {
         ref_pic_list0: &[&DpbEntry<Self::Handle>],
         ref_pic_list1: &[&DpbEntry<Self::Handle>],
     ) -> StatelessBackendResult<()> {
-        let context = &self.context;
+        let context = self.require_context();
 
         let slice_param = context
             .create_buffer(build_slice_param(
@@ -528,7 +528,7 @@ impl<V: VideoFrame> StatelessH264DecoderBackend for VaapiBackend<V> {
     ) -> NewPictureResult<Self::Picture> {
         Ok(VaapiPicture::new(
             timestamp,
-            Rc::clone(&self.context),
+            Rc::clone(self.require_context()),
             alloc_cb().ok_or(NewPictureError::OutOfOutputBuffers)?,
         ))
     }

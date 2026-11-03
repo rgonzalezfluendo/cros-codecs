@@ -192,7 +192,7 @@ impl<V: VideoFrame> VaapiDecodedHandle<V> {
 
 pub struct VaapiBackend<V: VideoFrame> {
     pub display: Rc<Display>,
-    pub context: Rc<Context>,
+    context: Option<Rc<Context>>,
     stream_info: StreamInfo,
     // TODO: We should try to support context reuse
     _supports_context_reuse: bool,
@@ -203,36 +203,31 @@ impl<V: VideoFrame> VaapiBackend<V> {
     pub(crate) fn new(display: Rc<libva::Display>, supports_context_reuse: bool) -> Self {
         let init_stream_info = StreamInfo {
             format: DecodedFormat::NV12,
-            coded_resolution: Resolution::from((16, 16)),
-            display_resolution: Resolution::from((16, 16)),
+            // No sequence header has been parsed yet. The real resolution is
+            // set in `new_sequence`.
+            coded_resolution: Resolution::from((0, 0)),
+            display_resolution: Resolution::from((0, 0)),
             min_num_frames: 1,
         };
-        let config = display
-            .create_config(
-                vec![libva::VAConfigAttrib {
-                    type_: libva::VAConfigAttribType::VAConfigAttribRTFormat,
-                    value: libva::VA_RT_FORMAT_YUV420,
-                }],
-                libva::VAProfile::VAProfileH264Main,
-                libva::VAEntrypoint::VAEntrypointVLD,
-            )
-            .expect("Could not create initial VAConfig!");
-        let context = display
-            .create_context::<<V as VideoFrame>::MemDescriptor>(
-                &config,
-                init_stream_info.coded_resolution.width,
-                init_stream_info.coded_resolution.height,
-                None,
-                true,
-            )
-            .expect("Could not create initial VAContext!");
         Self {
             display: display,
-            context: context,
+            context: None,
             _supports_context_reuse: supports_context_reuse,
             stream_info: init_stream_info,
             _phantom_data: Default::default(),
         }
+    }
+
+    /// Returns the VA context, or `None` if no sequence header has been parsed
+    /// yet.
+    pub fn context(&self) -> Option<&Rc<Context>> {
+        self.context.as_ref()
+    }
+
+    /// Returns the VA context, panicking if no sequence header has been parsed
+    /// yet.
+    pub(crate) fn require_context(&self) -> &Rc<Context> {
+        self.context().expect("VA context requested before sequence header was parsed")
     }
 
     pub(crate) fn new_sequence<StreamData>(
@@ -269,7 +264,7 @@ impl<V: VideoFrame> VaapiBackend<V> {
                 true,
             )
             .map_err(|_| anyhow!("Could not create VAContext!"))?;
-        self.context = context;
+        self.context = Some(context);
 
         Ok(())
     }

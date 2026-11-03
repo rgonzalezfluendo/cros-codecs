@@ -571,7 +571,7 @@ impl<V: VideoFrame> VaapiBackend<V> {
         picture: &mut <Self as StatelessDecoderBackendPicture<H265>>::Picture,
     ) -> anyhow::Result<()> {
         if let Some(last_slice) = picture.last_slice.take() {
-            let context = &self.context;
+            let context = self.require_context();
             let picture = &mut picture.picture;
 
             let slice_param = BufferType::SliceParameter(SliceParameter::HEVC(last_slice.0));
@@ -623,7 +623,7 @@ impl<V: VideoFrame> StatelessH265DecoderBackend for VaapiBackend<V> {
         Ok(VaapiH265Picture {
             picture: VaapiPicture::new(
                 timestamp,
-                Rc::clone(&self.context),
+                Rc::clone(self.require_context()),
                 alloc_cb().ok_or(NewPictureError::OutOfOutputBuffers)?,
             ),
             last_slice: Default::default(),
@@ -641,7 +641,7 @@ impl<V: VideoFrame> StatelessH265DecoderBackend for VaapiBackend<V> {
         rps: &RefPicSet<Self::Handle>,
         slice: &Slice,
     ) -> crate::decoder::stateless::StatelessBackendResult<()> {
-        let context = &self.context;
+        let context = self.require_context();
 
         let surface_id = picture.picture.surface().id();
 
